@@ -1,7 +1,7 @@
 ---
 description: Sol Recovery implementation worker
-model: cliproxyapi/gpt-5.6-sol
-thinking: xhigh
+model: "__SOL_LUNA_MODEL__"
+thinking: "__SOL_LUNA_THINKING__"
 tools: read, grep, find, ls, bash, edit, write
 max_turns: 40
 inherit_context: false

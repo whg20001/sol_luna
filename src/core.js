@@ -1,5 +1,5 @@
 export const PACKAGE_NAME = "pi-sol-luna-router";
-export const PACKAGE_VERSION = "0.1.0";
+export const PACKAGE_VERSION = "0.3.0";
 export const MANAGED_MARKER = "pi-sol-luna-router:managed:v1";
 export const STATE_ENTRY_TYPE = "pi-sol-luna-router/state";
 
