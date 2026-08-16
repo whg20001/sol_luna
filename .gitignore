@@ -1,0 +1,7 @@
+node_modules/
+.npm/
+coverage/
+*.log
+.e2e-*/
+.e2e-*
+.DS_Store

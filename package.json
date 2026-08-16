@@ -1,0 +1,36 @@
+{
+  "name": "pi-sol-luna-router",
+  "version": "0.1.0",
+  "description": "Project-local Sol/Luna subagent routing with a two-failure circuit breaker for Pi",
+  "type": "module",
+  "engines": {
+    "node": ">=22.19"
+  },
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "subagent",
+    "circuit-breaker"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.js"
+    ]
+  },
+  "files": [
+    "src/",
+    "templates/",
+    "README.md",
+    "LICENSE"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.84.1 <1",
+    "@earendil-works/pi-ai": ">=0.84.1 <1",
+    "typebox": ">=1.3.0 <2"
+  },
+  "scripts": {
+    "test": "node --test",
+    "check": "node --check src/index.js && node --check src/core.js && npm test"
+  },
+  "license": "MIT"
+}
