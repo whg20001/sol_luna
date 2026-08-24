@@ -1,7 +1,7 @@
 {
   "name": "pi-sol-luna-router",
-  "version": "0.3.0",
-  "description": "Multi-provider Sol/Luna routing with Pi, Codex, and DeepSeek harness adapters",
+  "version": "2.1.0",
+  "description": "Policy-driven, cache-friendly Sol/Luna agent runtime with frozen reasoning, projected context, validation tiers, and feedback loops",
   "type": "module",
   "engines": {
     "node": ">=22.19"
@@ -28,6 +28,14 @@
     "./core": "./src/core.js",
     "./model-routing": "./src/model-routing.js",
     "./router-service": "./src/router-service.js",
+    "./context-envelope": "./src/context-envelope.js",
+    "./task-memory": "./src/task-memory.js",
+    "./prompt-protocol": "./src/prompt-protocol.js",
+    "./token-budget": "./src/token-budget.js",
+    "./execution-policy": "./src/execution-policy.js",
+    "./semantic-memory": "./src/semantic-memory.js",
+    "./model-ranking": "./src/model-ranking.js",
+    "./runtime-events": "./src/runtime-events.js",
     "./adapters/harness": "./src/adapters/harness.js",
     "./adapters/codex": "./src/adapters/codex.js",
     "./adapters/deepseek": "./src/adapters/deepseek.js",
@@ -40,6 +48,7 @@
     "templates/",
     "examples/",
     "README.md",
+    "MODEL_ARCHITECTURE.md",
     "LICENSE"
   ],
   "peerDependencies": {
@@ -60,7 +69,7 @@
   },
   "scripts": {
     "test": "node --test",
-    "check": "node --check src/index.js && node --check src/core.js && node --check src/model-routing.js && node --check src/router-service.js && node --check src/adapters/pi.js && node --check src/adapters/harness.js && node --check src/adapters/codex.js && node --check src/adapters/deepseek.js && node --check examples/codex-harness.mjs && node --check examples/deepseek-harness.mjs && npm test"
+    "check": "node --check src/index.js && node --check src/core.js && node --check src/context-envelope.js && node --check src/task-memory.js && node --check src/prompt-protocol.js && node --check src/token-budget.js && node --check src/execution-policy.js && node --check src/semantic-memory.js && node --check src/model-ranking.js && node --check src/runtime-events.js && node --check src/model-routing.js && node --check src/router-service.js && node --check src/adapters/pi.js && node --check src/adapters/harness.js && node --check src/adapters/codex.js && node --check src/adapters/deepseek.js && node --check examples/codex-harness.mjs && node --check examples/deepseek-harness.mjs && npm test"
   },
   "license": "MIT"
 }

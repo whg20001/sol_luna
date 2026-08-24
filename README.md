@@ -1,95 +1,371 @@
 # pi-sol-luna-router
 
-A Sol/Luna implementation router with a two-failure circuit breaker.
+A policy-driven, cache-friendly, memory-aware, failure-resilient agent runtime for Pi, Codex, DeepSeek, and generic harnesses.
 
-The package now has two layers:
+Version 2.1 keeps the reliable Root Planner → Luna Executor → Sol Recovery circuit and incrementally adds:
 
-- A Pi Coding Agent adapter, kept as the default package entry.
-- A host-independent router service plus callback-based Codex, DeepSeek, and generic harness adapters.
+- Frozen task-level Reasoning Profiles
+- Execution Policy Engine
+- Root/Worker Context Projection
+- Fast/Deep Validator tiers
+- Failure Decision Summaries without chain-of-thought
+- Opt-in Semantic Memory retrieval
+- Dynamic token-budget feedback
+- Model performance ranking and lifecycle events
 
-The Codex and DeepSeek adapters do not assume a particular vendor SDK, CLI, model, or credential format. The host supplies the actual worker invocation and snapshot persistence callbacks. The package root intentionally remains the Pi adapter for backward compatibility; non-Pi consumers must import one of the documented host-independent subpaths.
+The v2.0 foundations remain unchanged:
 
-## Architecture
+- Agent Context Envelope
+- Task / Runtime / Artifact / Failure Memory
+- Failure Snapshots
+- Read-only Validator Agent
+- Token Budget Controller
+- Per-role model and thinking routing
+- Stable prompt prefixes for better prompt/KV-cache reuse
+
+## v2.1 architecture
 
 ```text
-src/core.js                 Pure state transitions and policy rules
-src/model-routing.js        Ordered multi-provider model selection and rendering
-src/router-service.js       Stateful, host-independent router facade
-src/adapters/pi.js          Pi lifecycle, tools, commands, files, and UI
-src/adapters/harness.js     Generic callback-based harness integration
-src/adapters/codex.js       Codex-named harness entry
-src/adapters/deepseek.js    DeepSeek-named harness entry
-src/index.js                Backward-compatible Pi extension entry
+User
+  |
+Root Planner (high reasoning, no direct writes)
+  |
+Execution Policy + Context Projection
+  |
+Task State + Memory + Feedback Manager
+  |
+  +--> Luna Executor (frozen medium reasoning, edits)
+          |
+       Fast Validator (low, read-only)
+          |
+       Deep Validator (medium, risk/failure triggered)
+          |
+       pass ------------------------------> passed
+          |
+       failure -> Failure Snapshot
+                    |
+               Luna retry (first failure)
+                    |
+               Sol Recovery (second failure, high reasoning)
+                    |
+               Validator -> passed / escalated
 ```
+
+The compatible circuit rule remains: one initial Luna attempt, one Luna retry after the first failed validation, and exactly one new Sol recovery after the second failed validation.
+
+## Modules
+
+```text
+src/core.js                 Circuit and compatible v2 stage transitions
+src/execution-policy.js     Reasoning Profile freeze and scheduling policy
+src/task-memory.js          Runtime/Task/Artifact/Failure/Semantic Memory
+src/context-envelope.js     Root/Worker projection and stable serialization
+src/prompt-protocol.js      Shared prefix, strict output, Decision Summary
+src/token-budget.js         Budgets, feedback adaptation, envelope compaction
+src/semantic-memory.js      Opt-in relevant-memory retrieval
+src/model-ranking.js        Historical model performance ranking
+src/runtime-events.js       Bounded lifecycle analytics events
+src/model-routing.js        Multi-provider selection plus optional ranking
+src/router-service.js       Stateful host-independent runtime facade
+src/adapters/pi.js          Pi lifecycle, tools, commands, and project files
+src/adapters/harness.js     Generic callback harness integration
+src/adapters/codex.js       Codex-named adapter
+src/adapters/deepseek.js    DeepSeek-named adapter
+```
+
+## Context Envelope
+
+Every prepared worker receives the same ordered protocol:
+
+```text
+Shared fixed protocol prefix
++ Role / runtime protocol
++ Context Envelope
++ Current Task
+```
+
+The stable envelope shape is:
+
+```json
+{
+  "version": "2.0",
+  "projection": "worker-artifact",
+  "runtime": {
+    "task_id": "task-123",
+    "context_id": "context-123",
+    "snapshot_id": null,
+    "request_id": null,
+    "role": "luna",
+    "version": "2.0",
+    "stage": "executing",
+    "status": "executing",
+    "attempt": 1,
+    "validator_mode": null,
+    "reasoning_profile": {
+      "version": "2.1",
+      "complexity": "medium"
+    },
+    "events": []
+  },
+  "goal": {
+    "objective": "Implement authentication",
+    "acceptance": ["npm test passes"],
+    "constraints": ["Keep the public API compatible"]
+  },
+  "state": {
+    "completed": [],
+    "pending": ["Implement authentication"],
+    "blocked": []
+  },
+  "artifact": {
+    "changed_files": [],
+    "diff_summary": "",
+    "tests": [],
+    "worker_reports": [],
+    "validation_reports": []
+  },
+  "failure": null,
+  "semantic": null,
+  "decision": null
+}
+```
+
+Memory projection is role-specific:
+
+| Role | Loaded memory |
+|---|---|
+| Planner | Compact Runtime + Goal + blockers/decision-needed summary |
+| Luna | Goal/State + Artifact + explicitly retrieved semantic hints |
+| Fast Validator | Acceptance + Artifact |
+| Deep Validator | Acceptance + Artifact + State + Failure evidence |
+| Sol | Goal/State + Artifact + Failure Snapshot + Decision Summary |
+
+All roles still receive minimal runtime IDs. Event streams, logs, reports, and arrays are bounded before serialization.
+
+## Failure Snapshot
+
+A failed validation creates and persists a snapshot containing:
+
+```json
+{
+  "snapshot_id": "failure-2",
+  "task_id": "task-123",
+  "context_id": "context-123",
+  "source_role": "luna",
+  "attempt": 2,
+  "current_progress": ["JWT parser updated"],
+  "modified_files": ["src/auth.js"],
+  "diff_summary": "Changed expiry comparison",
+  "attempt_history": [],
+  "current_error": {
+    "type": "test_failure",
+    "message": "Authentication suite failed",
+    "log": "bounded excerpt"
+  },
+  "validation": {},
+  "decision_summary": {
+    "attempt_goal": "Fix JWT expiration",
+    "approach": "Modify token parser",
+    "reason": "Expiry validation failed",
+    "evidence": ["authentication test failure"],
+    "not_attempted": ["database migration"],
+    "next_action": "inspect affected auth files"
+  },
+  "memory_revision": 7
+}
+```
+
+Sol preparation is blocked when a v2 task has no current Failure Snapshot. Sol receives the latest snapshot and is instructed to inspect affected files rather than re-read the entire project. `decision_summary` stores an auditable decision trace, never private chain-of-thought.
+
+## Reasoning Profile and Execution Policy
+
+`start_task` selects and freezes one profile for the task:
+
+```json
+{
+  "version": "2.1",
+  "taskId": "task-123",
+  "complexity": "medium",
+  "roles": {
+    "planner": { "thinking": "high" },
+    "luna": { "thinking": "medium" },
+    "validator": {
+      "fast": { "thinking": "low" },
+      "deep": { "thinking": "medium" }
+    },
+    "sol": { "thinking": "high" }
+  }
+}
+```
+
+Later calls cannot change complexity or thinking for the same task. Sol remains high because recovery is a separate role, not an upgraded Luna attempt. `src/execution-policy.js` decides the authorized next action and returns a serializable `PolicyDecision`.
+
+## Fast and Deep validation
+
+- Fast Validator runs syntax-only and Git diff/status checks through `sol_luna_validate`, then independently inspects supplied compile/test/lint evidence. Project scripts are not executed inside the strict Pi read-only boundary.
+- A Fast failure advances to Deep Validator without incrementing the Luna failure counter.
+- Security, architecture, public API compatibility, and other high-risk constraints select Deep Validator directly.
+- Only a failed Deep validation creates the normal implementation Failure Snapshot and advances the Luna/Sol circuit.
+
+## State machine
+
+The legacy `phase` remains in snapshots for compatibility. The v2 `stage` adds detail:
+
+```text
+idle
+  -> planning
+  -> executing
+  -> validating
+       -> passed
+       -> failure_snapshot
+            -> executing (one Luna retry)
+            -> recovery (one Sol attempt)
+                 -> validating
+                      -> passed
+                      -> escalated
+```
+
+Snapshots retain the outer format:
+
+```js
+{ version: 1, state: { /* circuit + v2 memory + pending request */ } }
+```
+
+Old raw state and `{ version: 1, state }` snapshots are migrated during restore.
+
+## Token and thinking policy
+
+Default output budgets:
+
+| Role | Thinking | Tokens |
+|---|---:|---:|
+| Planner | high | 4000 |
+| Luna | medium | 8000 |
+| Validator | low | 2000 |
+| Sol | high | 6000 |
+
+`low`, `medium`, and `high` task complexity apply configurable multipliers. The selected complexity is frozen in the Reasoning Profile. Recent role usage feedback can adjust output budgets within a bounded ±25% loop: repeated successful non-truncated calls reduce budget, while failures and truncation increase it. `compactEnvelopeToBudget()` removes old events, truncates logs, and drops old reports/tests before touching task state. Objective, acceptance criteria, and the current error are retained.
 
 ## Pi installation
 
-Install this package locally in the project where it should run:
+### Project-level install from GitHub
+
+Install both packages with Pi's project-local `-l` flag:
+
+```bash
+pi install -l git:github.com/whg20001/sol_luna.git
+pi install -l npm:@tintinweb/pi-subagents@0.16.1
+```
+
+This writes package declarations to `.pi/settings.json` and installs managed copies under `.pi/`; it does not install either extension globally. After the project is trusted, Pi automatically reconciles missing project packages on startup. Commit `.pi/settings.json` if the same pinned package setup should be shared with a team.
+
+For development from an existing checkout, replace the first command with:
 
 ```bash
 pi install -l /absolute/path/to/pi-sol-luna-router
 ```
 
-Install the Pi subagent tool separately:
+> **Current npm status:** `pi-sol-luna-router` is not yet published in the public npm registry. A plain `npm install` also does not register a Pi extension. Until this package is published with its Agent dependency bundled, complete project setup intentionally uses the two `pi install -l` commands above.
 
-```bash
-pi install -l npm:@tintinweb/pi-subagents@0.16.1
-```
-
-Configure at least one model provider in Pi. Built-in providers, `~/.pi/agent/models.json`, and provider extensions are all supported. CLIProxyAPI is optional rather than required:
-
-```bash
-pi install -l npm:@router-for-me/pi-cliproxyapi-provider@1.4.13
-```
-
-Authenticate configured providers with `/login <provider>`, then start a fresh session or run `/reload`. The project must be trusted before initialization.
+Authenticate at least one provider, trust the project, and reload Pi when requested. Then initialize the project runtime:
 
 ```text
 /sol-luna-init
 ```
 
-Use `/sol-luna-init --force` only when intentionally replacing modified managed files or conflicting managed keys.
+When `.pi/sol-luna-models.json` is missing, initialization now discovers authenticated Pi models and writes an explicit v2 route automatically. Selection order is:
 
-### Pi project files
+1. Available dedicated `gpt-5.6-luna` / `gpt-5.6-sol` routes.
+2. The current authenticated Pi model.
+3. The first authenticated model in deterministic `provider/model` order.
 
-Initialization creates or synchronizes files in the project Pi configuration directory, normally `.pi`:
+Planner defaults to inheriting the current Pi model. Existing v1 or v2 route files remain strict and are never silently rewritten or replaced.
 
-- `agents/luna-worker.md`
-- `agents/sol-worker.md`
-- `subagents.json`
-- `sol-luna-models.json` — user-editable ordered model routes
-- `sol-luna-router.json`
+Initialization creates or synchronizes:
 
-The Pi adapter dynamically injects its protocol and stores circuit state in the current Pi session with `appendEntry()`. Existing Pi command names, state entries, and the default `src/index.js` extension entry remain compatible.
+- `.pi/agents/luna-worker.md`
+- `.pi/agents/validator-worker.md`
+- `.pi/agents/sol-worker.md`
+- `.pi/subagents.json`
+- `.pi/sol-luna-models.json`
+- `.pi/sol-luna-router.json`
+
+Legacy v1 two-agent markers are recognized and safely upgraded when their recorded files are unchanged. The v2 runtime remains inactive for a legacy materialization until `/sol-luna-update` creates the Validator template.
 
 ### Pi commands
 
 - `/sol-luna-init [--force]`
 - `/sol-luna-update [--force]`
+- `/sol-luna-models` — interactive model configuration wizard
+- `/sol-luna-models status`
+- `/sol-luna-models auto [--force]`
+- `/sol-luna-models reset [--force]`
+- `/sol-luna-models set ... [--force]`
 - `/sol-luna-status`
 - `/sol-luna-remove [--force]`
 - `/sol-luna-reset`
 
-Parent `edit` and `write` calls are blocked while the Pi project configuration is materialized. Parent `bash` remains available for read-only inspection and validation and must not be used to bypass that restriction.
+### Pi tools
 
-### Multi-provider model routing
+- `sol_luna_gate` — starts a task, marks planning ready, and reports runtime status. It cannot record validation outcomes.
+- `sol_luna_prepare_worker` — creates the Context Envelope, request IDs, budget, snapshot reference, and rendered prompt.
+- `sol_luna_record_result` — records exact Luna/Sol/Validator JSON output and advances state.
+- `sol_luna_record_usage` — records observed tokens, latency, success/truncation, and optional model performance.
 
-`/sol-luna-init` creates `.pi/sol-luna-models.json` when a default route resolves successfully. If neither default source is available, create this file manually before retrying initialization. Each role has an ordered candidate list; initialization and update select the first exact `provider/model` currently available in Pi's model registry and pin it in the generated agent frontmatter.
+The required Pi flow is:
 
-Default routes prefer CLIProxyAPI and fall back to direct OpenAI:
+1. `sol_luna_gate(action="start_task", ...)`
+2. `sol_luna_prepare_worker(role="luna", ...)`
+3. Call `Agent(subagent_type="luna-worker", prompt=rendered_prompt)`
+4. `sol_luna_record_result(role="luna", report_json=...)`
+5. Prepare and call Fast `validator-worker`
+6. Record the Fast result; when policy requests it, prepare and call Deep Validator
+7. Record usage/model feedback when available
+8. Retry Luna once or prepare Sol when the circuit opens
+
+The adapter rewrites a managed Agent call to the exact prepared prompt, applies the routed model and thinking level, and blocks calls that are scheduled, resumed, model/thinking-overridden, unprepared, or dispatched twice. Managed agent templates intentionally omit fixed `model` and `thinking` frontmatter so pi-subagents uses these per-request routed values. Parent `edit`, `write`, and `bash` remain blocked.
+
+The extension adds only a static runtime protocol to the parent system prompt. Dynamic state is returned by tools rather than appended to the system prompt, improving cache stability.
+
+## Model routing
+
+Most users no longer need to edit JSON. Run the interactive command:
+
+```text
+/sol-luna-models
+```
+
+It presents authenticated models through Pi's UI and lets the user explicitly select Planner mode plus Luna, Validator, and Sol models. Planner, Luna, and Fast Validator thinking can be selected; Sol remains fixed at `high` by the recovery policy. Scripted or non-interactive configuration is also supported:
+
+```text
+/sol-luna-models set \
+  --planner-mode inherit \
+  --luna openai/model-a \
+  --validator openai/model-b \
+  --sol openai/model-c \
+  --luna-thinking medium \
+  --validator-thinking low \
+  --force
+```
+
+Use `/sol-luna-models status` to inspect current routes. `/sol-luna-models auto` creates recommended routes and `/sol-luna-models reset` explicitly replaces an existing file with newly discovered recommendations. Existing files require UI confirmation or `--force` before replacement.
+
+The generated file remains a normal explicit configuration for reproducibility. Advanced users can still edit it directly.
+
+Version 1 route files remain supported:
 
 ```json
 {
   "version": 1,
   "luna": {
-    "thinking": "xhigh",
+    "thinking": "medium",
     "candidates": [
       { "provider": "cliproxyapi", "model": "gpt-5.6-luna" },
       { "provider": "openai", "model": "gpt-5.6-luna" }
     ]
   },
   "sol": {
-    "thinking": "xhigh",
+    "thinking": "high",
     "candidates": [
       { "provider": "cliproxyapi", "model": "gpt-5.6-sol" },
       { "provider": "openai", "model": "gpt-5.6-sol" }
@@ -98,33 +374,33 @@ Default routes prefer CLIProxyAPI and fall back to direct OpenAI:
 }
 ```
 
-Candidates can reference any provider known to Pi, including OpenRouter, Ollama, vLLM, DeepSeek gateways, or private provider extensions. Model IDs may contain `/`; provider names may not.
+For v1 files, Planner inherits the parent model and Validator reuses Luna's selected model with `low` thinking.
+
+Version 2 supports all roles and complexity overrides:
 
 ```json
 {
-  "version": 1,
+  "version": 2,
+  "planner": { "mode": "inherit", "thinking": "high" },
   "luna": {
-    "thinking": "high",
-    "candidates": [
-      { "provider": "openrouter", "model": "anthropic/claude-sonnet-4" },
-      { "provider": "ollama", "model": "qwen2.5-coder:32b" }
-    ]
+    "thinking": "medium",
+    "thinkingByComplexity": { "low": "low", "medium": "medium", "high": "high" },
+    "candidates": [{ "provider": "openai", "model": "gpt-5.6-luna" }]
+  },
+  "validator": {
+    "thinking": "low",
+    "candidates": [{ "provider": "openai", "model": "gpt-5.6-luna" }]
   },
   "sol": {
     "thinking": "high",
-    "candidates": [
-      { "provider": "openai", "model": "gpt-5.6-sol" },
-      { "provider": "local-vllm", "model": "deepseek-ai/DeepSeek-V3" }
-    ]
+    "candidates": [{ "provider": "openai", "model": "gpt-5.6-sol" }]
   }
 }
 ```
 
-After editing the file, run `/reload` and `/sol-luna-update`. `/sol-luna-status` shows candidate availability, the currently selected route, and the model pinned in each managed agent. Selection is deterministic at initialization/update time; the parent Agent call must not override it. `/sol-luna-remove` preserves the user-editable model route file.
+Selection first filters exact available `provider/model` candidates. With no performance history it preserves configured order. When a performance store is supplied, available candidates are stably ranked by success, quality, normalized cost, and latency; scorer failures fall back to configured order. Provider names cannot contain `/`; model IDs may.
 
 ## Host-independent router service
-
-Importing this subpath does not load the Pi adapter:
 
 ```js
 import { createRouterService } from "pi-sol-luna-router/router-service";
@@ -132,123 +408,122 @@ import { createRouterService } from "pi-sol-luna-router/router-service";
 const router = createRouterService({
   snapshot: previouslyStoredSnapshot,
   taskIdFactory: () => crypto.randomUUID(),
+  contextIdFactory: ({ taskId }) => `context-${taskId}`,
 });
 
-router.gate("start_task", { taskLabel: "implement feature" });
-const luna = router.prepareWorkerCall({ role: "luna" });
+router.gate("start_task", {
+  taskLabel: "implement feature",
+  objective: "Implement feature",
+  acceptance: ["npm test passes"],
+  constraints: ["Keep the API compatible"],
+});
 
-// After the host runs validation:
-router.gate("luna_failed", { reason: "approved test command failed" });
+const prepared = router.prepareWorkerRequest({
+  role: "luna",
+  instruction: "Implement the approved task",
+  complexity: "medium",
+});
+
+router.markWorkerDispatched({ role: "luna", requestId: prepared.request.requestId });
+const workerJson = await runWorker(prepared.request.renderedPrompt);
+router.recordWorkerReport({ role: "luna", requestId: prepared.request.requestId, report: workerJson });
+const validator = router.prepareWorkerRequest({ role: "validator", instruction: "Run approved checks" });
+router.markWorkerDispatched({ role: "validator", requestId: validator.request.requestId });
+router.recordValidation({ role: "luna", requestId: validator.request.requestId, report: validatorJson });
 ```
 
 Important methods:
 
 - `getState()`
-- `snapshot()`
-- `restore(snapshotOrState)`
+- `getMemory()`
+- `getPendingRequest()`
+- `getReasoningProfile()` / `getPolicyDecision()`
+- `getContextEnvelope({ role, validatorMode })`
+- `getFailureSnapshot(snapshotId?)`
+- `retrieveRelevantMemory(query)` / `addSemanticMemory(entry)`
+- `snapshot()` / `restore()`
 - `gate(action, payload)`
-- `prepareWorkerCall({ role, resume })`
+- `prepareWorkerRequest(...)`
+- `markWorkerDispatched(...)`
+- `recordWorkerReport(...)`
+- `recordValidation(...)`
+- `recordUsageFeedback(...)` / `recordModelFeedback(...)`
+- `prepareWorkerCall(...)` — legacy compatibility
 - `reset()`
-
-Snapshots retain the compatible `{ version: 1, state }` format.
 
 ## Generic harness adapter
 
 ```js
 import { createHarnessAdapter } from "pi-sol-luna-router/adapters/harness";
 
-const router = createHarnessAdapter({
-  harnessName: "my-agent-runtime",
-  snapshot: previouslyStoredSnapshot,
-  taskIdFactory: () => createTaskId(),
-  workerBindings: {
-    luna: lunaWorkerConfig,
-    sol: solWorkerConfig,
-  },
-  invokeWorker: async ({ role, binding, input, signal, routerState }) => {
-    return myHarness.runWorker({ role, binding, input, signal, routerState });
-  },
-  saveSnapshot: async (snapshot, metadata) => {
-    await sessionStore.save(snapshot, metadata);
-  },
-});
-
-await router.gate("start_task", { taskLabel: "implement feature" });
-const lunaResult = await router.invoke("luna", { prompt: "Implement the approved task" });
-
-// Run the real acceptance checks, then explicitly update the gate:
-await router.gate("passed");
-```
-
-The adapter deliberately does not infer validation success or failure from a worker return value. The parent harness must run its approved checks and call `gate()` explicitly.
-
-For Sol recovery, the adapter persists `sol_started` before invoking the worker. If persistence fails, execution is prevented and state is rolled back. If the worker starts and then throws, the one allowed Sol attempt remains consumed. Operations are serialized within one adapter instance; applications running multiple router instances against the same store should add storage-level compare-and-swap or version checks.
-
-## Codex adapter
-
-```js
-import { createCodexAdapter } from "pi-sol-luna-router/adapters/codex";
-
-const router = createCodexAdapter({
+const runtime = createHarnessAdapter({
   snapshot,
   workerBindings: {
-    luna: codexLunaProfile,
-    sol: codexSolProfile,
+    luna: lunaProfile,
+    validator: validatorProfile,
+    sol: solProfile,
   },
-  invokeWorker: ({ binding, input, signal }) => {
-    return runCodex({ profile: binding, prompt: input, signal });
+  invokeWorker: async ({ binding, request, signal }) => {
+    return harness.run({
+      binding,
+      prompt: request.renderedPrompt,
+      maxOutputTokens: request.budget.maxOutputTokens,
+      signal,
+    });
   },
   saveSnapshot,
 });
-```
 
-`runCodex` is supplied by the integrating application and may wrap Codex CLI, an SDK, or an existing internal runner. See `examples/codex-harness.mjs`.
-
-## DeepSeek harness adapter
-
-```js
-import { createDeepSeekAdapter } from "pi-sol-luna-router/adapters/deepseek";
-
-const router = createDeepSeekAdapter({
-  snapshot,
-  workerBindings: {
-    luna: deepSeekLunaConfig,
-    sol: deepSeekSolConfig,
-  },
-  invokeWorker: ({ binding, input, signal }) => {
-    return deepSeekHarness.run({ config: binding, input, signal });
-  },
-  saveSnapshot,
+await runtime.gate("start_task", {
+  taskLabel: "implement feature",
+  acceptance: ["tests pass"],
 });
+await runtime.invoke("luna", "Implement the approved task");
+await runtime.invoke("validator", "Run approved validation");
 ```
 
-The package does not assume that “DeepSeek” means a specific API shape. See `examples/deepseek-harness.mjs`.
+`validator` binding is optional for compatibility. Without it, the host can run checks itself and call the adapter's trusted-host `recordValidation()` method explicitly. The Pi flow always requires a prepared and dispatched Validator result.
 
-## Protocol
+The adapter forwards both legacy fields (`binding`, `input`, `routerState`) and v2 fields (`request`, `contextEnvelope`, `taskId`, `contextId`, `snapshotId`, `budget`, `routing`, `renderedPrompt`). Managed output is validated against the role-specific strict JSON schema by default (`strictWorkerOutput: true`); malformed output becomes a recorded failure snapshot rather than a deadlocked pending request. A worker's self-reported success never marks the task passed; only Validator output or explicit trusted-host validation does.
 
-1. Start each task with `start_task`.
-2. Use Luna as the default implementation worker.
-3. Run approved acceptance and validation commands in the parent harness.
-4. The first `luna_failed` permits one more Luna attempt.
-5. The second `luna_failed` opens the circuit and blocks Luna calls and resumes.
-6. Start exactly one new Sol recovery worker; do not hot-switch or resume Luna.
-7. Record final success with `passed` or failed recovery with `sol_failed`.
-8. Escalate to the user after failed Sol recovery.
+Codex and DeepSeek wrappers are in `examples/`.
 
-## Security boundary
+## Security and persistence
 
-The generic, Codex, and DeepSeek adapters enforce routing state, but they cannot automatically control an unknown host's filesystem tools. Integrations should enforce parent read-only behavior with sandboxing, capability allowlists, or read-only workspace mounts instead of relying only on prompts.
+- Generic adapters cannot enforce filesystem permissions for unknown hosts. Use sandboxes, read-only mounts, or capability allowlists for the parent and Validator.
+- Logs and histories are bounded, but integrating hosts should still avoid placing secrets in worker reports.
+- Adapter operations are serialized per instance. Multiple instances sharing storage should add compare-and-swap checks using the persisted revision.
+- Sol start is persisted before execution. A failed persistence prevents launch; a started Sol attempt is never silently restored.
 
-## Requirements
+## Package exports
 
-- Node `>=22.19`.
-- Generic/Codex/DeepSeek adapter users need no Pi runtime dependency.
-- The Pi adapter requires compatible `@earendil-works/pi-coding-agent`, `@earendil-works/pi-ai`, and `typebox` packages.
-- The Pi workflow requires `@tintinweb/pi-subagents@0.16.1`.
-- Model providers are user-selectable; CLIProxyAPI is only one optional route source.
+Host-independent imports do not load Pi peers:
 
-## Validation
+- `pi-sol-luna-router/core`
+- `pi-sol-luna-router/router-service`
+- `pi-sol-luna-router/context-envelope`
+- `pi-sol-luna-router/task-memory`
+- `pi-sol-luna-router/prompt-protocol`
+- `pi-sol-luna-router/token-budget`
+- `pi-sol-luna-router/model-routing`
+- `pi-sol-luna-router/adapters/harness`
+- `pi-sol-luna-router/adapters/codex`
+- `pi-sol-luna-router/adapters/deepseek`
+
+The package root remains the Pi adapter for backward compatibility.
+
+## Requirements and validation
+
+- Node `>=22.19`
+- Pi peer packages `>=0.84.1 <1`
+- Project-local `@tintinweb/pi-subagents@0.16.1`
+- At least one authenticated Pi model; the Sol route must support `high` thinking
 
 ```bash
 npm run check
+npm pack --dry-run
 ```
+
+The current v2.1 suite contains 102 tests when Pi peer dependencies are available. Pi integration tests skip cleanly in a host-independent install without those peers.
+
+For the complete design, compatibility matrix, security boundaries, and lifecycle specification, see [`MODEL_ARCHITECTURE.md`](./MODEL_ARCHITECTURE.md).

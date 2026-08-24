@@ -9,12 +9,14 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import {
   AGENT_NAMES,
+  LEGACY_AGENT_NAMES,
+  LEGACY_MANAGED_MARKER,
   MANAGED_MARKER,
   PACKAGE_NAME,
   PACKAGE_VERSION,
@@ -31,26 +33,23 @@ import {
   removeManagedSubagents,
 } from "../core.js";
 import {
-  DEFAULT_MODEL_ROUTES,
-  MODEL_ROUTE_ROLES,
+  THINKING_LEVELS,
+  WORKER_ROUTE_ROLES,
+  buildAutoModelRoutes,
   modelReference,
   normalizeModelRoutes,
-  renderAgentTemplate,
   resolveModelRoutes,
 } from "../model-routing.js";
+import { CACHE_FRIENDLY_PROTOCOL_PREFIX, validateWorkerOutput } from "../prompt-protocol.js";
 import { createRouterService } from "../router-service.js";
 
 const AGENT_INSTALL_COMMAND = "pi install -l npm:@tintinweb/pi-subagents@0.16.1";
 const MODEL_ROUTES_FILE = "sol-luna-models.json";
 const AGENT_TEMPLATE_URLS = Object.freeze({
   "agents/luna-worker.md": new URL("../../templates/agents/luna-worker.md", import.meta.url),
+  "agents/validator-worker.md": new URL("../../templates/agents/validator-worker.md", import.meta.url),
   "agents/sol-worker.md": new URL("../../templates/agents/sol-worker.md", import.meta.url),
 });
-const AGENT_TEMPLATE_ROLES = Object.freeze({
-  "agents/luna-worker.md": "luna",
-  "agents/sol-worker.md": "sol",
-});
-
 function projectPaths(cwd) {
   const configDir = join(cwd, CONFIG_DIR_NAME);
   return {
@@ -60,6 +59,7 @@ function projectPaths(cwd) {
     marker: join(configDir, "sol-luna-router.json"),
     modelRoutes: join(configDir, MODEL_ROUTES_FILE),
     luna: join(configDir, "agents", "luna-worker.md"),
+    validator: join(configDir, "agents", "validator-worker.md"),
     sol: join(configDir, "agents", "sol-worker.md"),
   };
 }
@@ -141,12 +141,9 @@ function sha256(value) {
   return createHash("sha256").update(value, "utf8").digest("hex");
 }
 
-function templateContents(selections) {
+function templateContents() {
   return Object.fromEntries(
-    Object.entries(AGENT_TEMPLATE_URLS).map(([relative, url]) => {
-      const role = AGENT_TEMPLATE_ROLES[relative];
-      return [relative, renderAgentTemplate(readFileSync(url, "utf8"), selections[role])];
-    }),
+    Object.entries(AGENT_TEMPLATE_URLS).map(([relative, url]) => [relative, readFileSync(url, "utf8")]),
   );
 }
 
@@ -157,7 +154,7 @@ function makeMarker(templates, selections) {
     managedMarker: MANAGED_MARKER,
     managedFiles: Object.fromEntries(Object.entries(templates).map(([relative, content]) => [relative, sha256(content)])),
     resolvedModels: Object.fromEntries(
-      MODEL_ROUTE_ROLES.map((role) => [role, {
+      WORKER_ROUTE_ROLES.map((role) => [role, {
         provider: selections[role].provider,
         model: selections[role].model,
         thinking: selections[role].thinking,
@@ -168,10 +165,14 @@ function makeMarker(templates, selections) {
 
 function validMarker(marker) {
   if (!isPlainObject(marker)) return false;
-  if (marker.package !== PACKAGE_NAME || marker.managedMarker !== MANAGED_MARKER) return false;
+  if (marker.package !== PACKAGE_NAME) return false;
+  if (![MANAGED_MARKER, LEGACY_MANAGED_MARKER].includes(marker.managedMarker)) return false;
   if (!isPlainObject(marker.managedFiles)) return false;
-  const expectedFiles = AGENT_NAMES.map((name) => `agents/${name}.md`);
-  if (Object.keys(marker.managedFiles).some((relative) => !expectedFiles.includes(relative))) return false;
+  const currentFiles = AGENT_NAMES.map((name) => `agents/${name}.md`);
+  const legacyFiles = LEGACY_AGENT_NAMES.map((name) => `agents/${name}.md`);
+  const recordedFiles = Object.keys(marker.managedFiles);
+  const expectedFiles = recordedFiles.length === legacyFiles.length ? legacyFiles : currentFiles;
+  if (recordedFiles.length !== expectedFiles.length || recordedFiles.some((relative) => !expectedFiles.includes(relative))) return false;
   return expectedFiles.every((relative) => {
     const hash = marker.managedFiles[relative];
     return typeof hash === "string" && /^[a-f0-9]{64}$/u.test(hash);
@@ -181,13 +182,45 @@ function validMarker(marker) {
 function materialization(cwd) {
   try {
     const paths = projectPaths(cwd);
-    return isMaterialized({
-      markerExists: Boolean(assertRegularPath(paths.marker)),
-      lunaExists: Boolean(assertRegularPath(paths.luna)),
-      solExists: Boolean(assertRegularPath(paths.sol)),
+    const marker = readMarker(paths);
+    if (!validMarker(marker) || marker.managedMarker !== MANAGED_MARKER || marker.version !== PACKAGE_VERSION) return false;
+    const expectedTemplates = templateContents();
+    const managedFiles = {
+      "agents/luna-worker.md": paths.luna,
+      "agents/validator-worker.md": paths.validator,
+      "agents/sol-worker.md": paths.sol,
+    };
+    const integrity = Object.entries(managedFiles).every(([relative, path]) => {
+      const content = readText(path);
+      const expectedHash = sha256(expectedTemplates[relative]);
+      return content !== undefined
+        && sha256(content) === expectedHash
+        && marker.managedFiles[relative] === expectedHash;
+    });
+    return integrity && isMaterialized({
+      markerExists: true,
+      lunaExists: true,
+      validatorExists: true,
+      solExists: true,
     });
   } catch {
     return false;
+  }
+}
+
+function managedRuntimeState(cwd) {
+  try {
+    const paths = projectPaths(cwd);
+    const marker = readMarker(paths);
+    if (marker === undefined) {
+      const managedAgentPresent = [paths.luna, paths.validator, paths.sol]
+        .some((path) => lstatOrUndefined(path) !== undefined);
+      return managedAgentPresent ? "unsafe" : "inactive";
+    }
+    if (!validMarker(marker) || marker.managedMarker !== MANAGED_MARKER) return "unsafe";
+    return materialization(cwd) ? "ready" : "unsafe";
+  } catch {
+    return "unsafe";
   }
 }
 
@@ -197,6 +230,10 @@ function hasAgentTool(pi) {
 
 function modelIsAvailable(ctx, { provider, model }) {
   const registry = ctx.modelRegistry;
+  const scoped = Array.isArray(ctx.scopedModels) && ctx.scopedModels.length > 0
+    ? ctx.scopedModels.some((entry) => entry?.model?.provider === provider && entry?.model?.id === model)
+    : true;
+  if (!scoped) return false;
   try {
     if (typeof registry?.getAvailable === "function") {
       return hasExactAvailableModel(registry.getAvailable(), { provider, model });
@@ -221,14 +258,152 @@ function missingAgentMessage() {
 
 function readModelRoutes(paths) {
   const existing = readJson(paths.modelRoutes, { defaultValue: undefined });
-  if (existing !== undefined) {
-    return { config: normalizeModelRoutes(existing), source: "project" };
-  }
-  return { config: normalizeModelRoutes(DEFAULT_MODEL_ROUTES), source: "default" };
+  return existing === undefined
+    ? { config: null, source: "missing" }
+    : { config: normalizeModelRoutes(existing), source: "project" };
 }
 
-function resolveProjectModels(ctx, config) {
-  return resolveModelRoutes(config, (candidate) => modelIsAvailable(ctx, candidate));
+function candidateFromModel(model) {
+  const provider = typeof model?.provider === "string" ? model.provider.trim() : "";
+  const id = typeof model?.id === "string" ? model.id.trim() : "";
+  return provider && id ? { provider, model: id } : null;
+}
+
+function availableProjectModels(ctx) {
+  if (typeof ctx.modelRegistry?.getAvailable !== "function") {
+    throw new Error("This Pi model registry cannot enumerate authenticated models. Upgrade Pi or use /sol-luna-models set with a supported Pi version.");
+  }
+  const scoped = Array.isArray(ctx.scopedModels) && ctx.scopedModels.length > 0
+    ? new Set(ctx.scopedModels.map((entry) => candidateFromModel(entry?.model)).filter(Boolean).map(modelReference))
+    : null;
+  const models = [];
+  const seen = new Set();
+  for (const model of ctx.modelRegistry.getAvailable()) {
+    const candidate = candidateFromModel(model);
+    if (!candidate) continue;
+    const reference = modelReference(candidate);
+    if ((scoped && !scoped.has(reference)) || seen.has(reference)) continue;
+    seen.add(reference);
+    models.push(model);
+  }
+  return models.sort((left, right) => {
+    const leftReference = modelReference(candidateFromModel(left));
+    const rightReference = modelReference(candidateFromModel(right));
+    return leftReference < rightReference ? -1 : leftReference > rightReference ? 1 : 0;
+  });
+}
+
+function modelByReference(models, reference) {
+  return models.find((model) => modelReference(candidateFromModel(model)) === reference) ?? null;
+}
+
+function scopedThinkingLevel(ctx, model) {
+  if (!model || !Array.isArray(ctx?.scopedModels)) return null;
+  const match = ctx.scopedModels.find((entry) => (
+    entry?.model?.provider === model.provider && entry?.model?.id === model.id
+  ));
+  return THINKING_LEVELS.includes(match?.thinkingLevel) ? match.thinkingLevel : null;
+}
+
+function supportedThinkingLevels(model) {
+  if (model?.reasoning === false) return ["off"];
+  const mapping = model?.thinkingLevelMap;
+  if (!mapping || typeof mapping !== "object" || Array.isArray(mapping)) {
+    return ["off", "minimal", "low", "medium", "high"];
+  }
+  return THINKING_LEVELS.filter((level) => {
+    if (Object.hasOwn(mapping, level)) return mapping[level] !== null;
+    return !["xhigh", "max"].includes(level);
+  });
+}
+
+function clampThinking(model, requested, ctx) {
+  const pinned = scopedThinkingLevel(ctx, model);
+  if (pinned) return pinned;
+  const supported = supportedThinkingLevels(model);
+  if (supported.includes(requested)) return requested;
+  const requestedIndex = THINKING_LEVELS.indexOf(requested);
+  for (let index = requestedIndex; index >= 0; index -= 1) {
+    if (supported.includes(THINKING_LEVELS[index])) return THINKING_LEVELS[index];
+  }
+  return supported[0] ?? "off";
+}
+
+function currentModelCandidate(ctx, models) {
+  const current = candidateFromModel(ctx.model);
+  if (!current) return null;
+  return modelByReference(models, modelReference(current)) ? current : null;
+}
+
+function automaticModelRoutes(ctx, { plannerMode = "inherit" } = {}) {
+  const models = availableProjectModels(ctx);
+  if (models.length === 0) {
+    throw new Error("No authenticated models are available. Configure a provider with /login or /model, then run /sol-luna-init again.");
+  }
+  const base = buildAutoModelRoutes({
+    availableCandidates: models.map(candidateFromModel),
+    currentCandidate: currentModelCandidate(ctx, models),
+    plannerMode,
+  });
+  const solCandidates = base.sol.candidates.filter((candidate) => {
+    const model = modelByReference(models, modelReference(candidate));
+    const pinned = scopedThinkingLevel(ctx, model);
+    return supportedThinkingLevels(model).includes("high") && (!pinned || pinned === "high");
+  });
+  if (solCandidates.length === 0) {
+    throw new Error("Sol Recovery requires at least one authenticated model that supports high thinking within the current Pi model scope.");
+  }
+  const configured = { ...base, sol: { ...base.sol, candidates: solCandidates } };
+  const routeModel = (role) => modelByReference(models, modelReference(configured[role].candidates[0]));
+  const plannerModel = plannerMode === "route" ? routeModel("planner") : ctx.model;
+  return normalizeModelRoutes({
+    ...configured,
+    planner: { ...configured.planner, thinking: clampThinking(plannerModel, configured.planner.thinking, ctx) },
+    luna: { ...configured.luna, thinking: clampThinking(routeModel("luna"), configured.luna.thinking, ctx) },
+    validator: { ...configured.validator, thinking: clampThinking(routeModel("validator"), configured.validator.thinking, ctx) },
+    sol: { ...configured.sol, thinking: "high" },
+  });
+}
+
+function effectiveModelRoutes(ctx, paths) {
+  const existing = readModelRoutes(paths);
+  return existing.config
+    ? existing
+    : { config: automaticModelRoutes(ctx), source: "auto-preview" };
+}
+
+function resolveProjectModels(ctx, config, options = {}) {
+  const resolution = resolveModelRoutes(config, (candidate) => modelIsAvailable(ctx, candidate), options);
+  for (const role of ["planner", ...WORKER_ROUTE_ROLES]) {
+    const selection = resolution.selections[role];
+    const model = selection
+      ? (ctx.modelRegistry?.find?.(selection.provider, selection.model)
+        ?? ctx.modelRegistry?.getAvailable?.().find((entry) => entry.provider === selection.provider && entry.id === selection.model)
+        ?? { provider: selection.provider, id: selection.model })
+      : role === "planner" && resolution.roles.planner.mode === "inherit"
+        ? ctx.model
+        : null;
+    const pinned = scopedThinkingLevel(ctx, model);
+    const supported = supportedThinkingLevels(model);
+    if (role === "sol" && selection) {
+      if ((pinned && pinned !== "high") || !supported.includes("high")) {
+        throw new Error(`Sol route ${modelReference(selection)} must support the fixed high thinking level${pinned ? ` and is scope-pinned to ${pinned}` : ""}.`);
+      }
+      resolution.roles.sol.thinking = "high";
+      resolution.roles.sol.selection.thinking = "high";
+      resolution.selections.sol.thinking = "high";
+      continue;
+    }
+    const effectiveThinking = pinned ?? resolution.roles[role].thinking;
+    if (model && !supported.includes(effectiveThinking)) {
+      throw new Error(`${role} route ${modelReference(candidateFromModel(model))} does not support thinking=${effectiveThinking}.`);
+    }
+    if (!pinned) continue;
+    resolution.roles[role].thinking = pinned;
+    if (resolution.roles[role].selection) resolution.roles[role].selection.thinking = pinned;
+    if (resolution.selections[role]) resolution.selections[role].thinking = pinned;
+  }
+  return resolution;
 }
 
 function missingModelMessage(resolution) {
@@ -239,14 +414,14 @@ function missingModelMessage(resolution) {
   return [
     "No available model route could be resolved for one or more Sol-Luna roles:",
     ...roleLines.map((line) => `- ${line}`),
-    `Create or edit ${CONFIG_DIR_NAME}/${MODEL_ROUTES_FILE} to configure ordered provider/model candidates.`,
-    "Configure each provider and authentication in Pi, then run /reload and /sol-luna-update.",
+    "Run /sol-luna-models to select models interactively, or /sol-luna-models auto --force to rebuild from authenticated models.",
+    "Configure each provider and authentication in Pi, then run /sol-luna-update.",
     "Custom providers from models.json or provider extensions are supported; credentials are never read or copied by this package.",
   ].join("\n");
 }
 
 function modelStatusLines(resolution) {
-  return MODEL_ROUTE_ROLES.flatMap((role) => {
+  return WORKER_ROUTE_ROLES.flatMap((role) => {
     const detail = resolution.roles[role];
     const selected = detail.selected ? modelReference(detail.selected) : "(none)";
     return [
@@ -264,6 +439,10 @@ function notify(ctx, message, level = "info") {
 
 function forceRequested(args) {
   return String(args ?? "").trim().split(/\s+/u).includes("--force");
+}
+
+function deepValidatorThinking(value) {
+  return ["high", "xhigh", "max"].includes(value) ? value : "medium";
 }
 
 async function confirmConflicts(ctx, descriptions, force) {
@@ -293,27 +472,47 @@ function readMarker(paths) {
   return marker;
 }
 
-async function syncProject(pi, ctx, force, operation) {
-  if (!requireTrusted(ctx)) return;
+async function syncProject(pi, ctx, force, operation, options = {}) {
+  if (!requireTrusted(ctx)) return false;
   if (!hasAgentTool(pi)) {
     notify(ctx, missingAgentMessage(), "error");
-    return;
+    return false;
   }
 
-  const paths = ensureProjectDirectories(ctx.cwd);
-  const { config: modelRoutes, source: modelRoutesSource } = readModelRoutes(paths);
+  const paths = projectPaths(ctx.cwd);
+  const existingRoutes = options.modelRoutesOverride ? { config: null, source: "override" } : readModelRoutes(paths);
+  let modelRoutes;
+  let shouldWriteModelRoutes = false;
+  let modelRoutesSource;
+  try {
+    if (options.modelRoutesOverride) {
+      modelRoutes = normalizeModelRoutes(options.modelRoutesOverride);
+      modelRoutesSource = "configured";
+      shouldWriteModelRoutes = true;
+    } else if (existingRoutes.config) {
+      modelRoutes = existingRoutes.config;
+      modelRoutesSource = "project";
+    } else {
+      modelRoutes = automaticModelRoutes(ctx);
+      modelRoutesSource = "auto-discovered";
+      shouldWriteModelRoutes = true;
+    }
+  } catch (error) {
+    notify(ctx, `Model route discovery failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+    return false;
+  }
   const modelResolution = resolveProjectModels(ctx, modelRoutes);
   if (!modelResolution.ok) {
     notify(ctx, missingModelMessage(modelResolution), "error");
-    return;
+    return false;
   }
 
   const marker = readMarker(paths);
   if (marker !== undefined && !validMarker(marker)) {
     notify(ctx, "Invalid Sol-Luna router marker; refusing to overwrite project files. Remove it deliberately or repair it first.", "error");
-    return;
+    return false;
   }
-  const templates = templateContents(modelResolution.selections);
+  const templates = templateContents();
   const existingFiles = Object.fromEntries(
     Object.entries(templates).map(([relative]) => {
       const path = join(paths.configDir, relative);
@@ -343,12 +542,13 @@ async function syncProject(pi, ctx, force, operation) {
         ctx.hasUI ? "Configuration update cancelled; no project files were changed." : `Configuration update refused without UI. Re-run with --force to replace: ${conflicts.join(", ")}`,
         "warning",
       );
-      return;
+      return false;
     }
     subagentMerge = mergeSubagents(subagents, { force: true });
   }
 
-  if (modelRoutesSource === "default") writeAtomic(paths.modelRoutes, jsonText(modelRoutes));
+  ensureProjectDirectories(ctx.cwd);
+  if (shouldWriteModelRoutes) writeAtomic(paths.modelRoutes, jsonText(modelRoutes));
   for (const [relative, item] of Object.entries(existingFiles)) {
     const desired = templates[relative];
     const decision = managedFileDecision(item.content, desired, { force: true });
@@ -357,11 +557,12 @@ async function syncProject(pi, ctx, force, operation) {
   writeAtomic(paths.subagents, jsonText(subagentMerge.value));
   writeAtomic(paths.marker, jsonText(makeMarker(templates, modelResolution.selections)));
 
-  const selectedModels = MODEL_ROUTE_ROLES.map(
+  const selectedModels = WORKER_ROUTE_ROLES.map(
     (role) => `${role}=${modelReference(modelResolution.selections[role])}`,
   ).join(", ");
-  notify(ctx, `${operation} complete: ${CONFIG_DIR_NAME}/agents/luna-worker.md, ${CONFIG_DIR_NAME}/agents/sol-worker.md, ${CONFIG_DIR_NAME}/subagents.json, ${CONFIG_DIR_NAME}/${MODEL_ROUTES_FILE}, and ${CONFIG_DIR_NAME}/sol-luna-router.json are synchronized. Selected models: ${selectedModels}.`, "success");
+  notify(ctx, `${operation} complete (${modelRoutesSource} routes): ${CONFIG_DIR_NAME}/agents/luna-worker.md, ${CONFIG_DIR_NAME}/agents/validator-worker.md, ${CONFIG_DIR_NAME}/agents/sol-worker.md, ${CONFIG_DIR_NAME}/subagents.json, ${CONFIG_DIR_NAME}/${MODEL_ROUTES_FILE}, and ${CONFIG_DIR_NAME}/sol-luna-router.json are synchronized. Selected models: ${selectedModels}.`, "success");
   await ctx.reload();
+  return true;
 }
 
 function safePresence(path) {
@@ -387,18 +588,18 @@ function statusReport(pi, ctx, state) {
 
   let routeLines;
   try {
-    const { config, source } = readModelRoutes(paths);
+    const { config, source } = effectiveModelRoutes(ctx, paths);
     const resolution = resolveProjectModels(ctx, config);
     routeLines = [
-      `Model routes: ${source === "project" ? `${CONFIG_DIR_NAME}/${MODEL_ROUTES_FILE}` : "built-in defaults (file missing)"}`,
+      `Model routes: ${source === "project" ? `${CONFIG_DIR_NAME}/${MODEL_ROUTES_FILE}` : "automatic preview (file missing)"}`,
       ...modelStatusLines(resolution),
     ];
     if (validMarker(marker) && isPlainObject(marker.resolvedModels)) {
-      routeLines.push(...MODEL_ROUTE_ROLES.map((role) => {
+      routeLines.push(...WORKER_ROUTE_ROLES.map((role) => {
         const recorded = marker.resolvedModels[role];
         if (!recorded?.provider || !recorded?.model) return `${role} marker model: unknown (legacy marker)`;
         const relative = `agents/${role}-worker.md`;
-        const path = role === "luna" ? paths.luna : paths.sol;
+        const path = role === "luna" ? paths.luna : role === "validator" ? paths.validator : paths.sol;
         let integrity;
         try {
           const content = readText(path);
@@ -424,6 +625,7 @@ function statusReport(pi, ctx, state) {
     `Marker: ${markerLine}`,
     `${MODEL_ROUTES_FILE}: ${safePresence(paths.modelRoutes)}`,
     `luna-worker.md: ${safePresence(paths.luna)}`,
+    `validator-worker.md: ${safePresence(paths.validator)}`,
     `sol-worker.md: ${safePresence(paths.sol)}`,
     `subagents.json: ${safePresence(paths.subagents)}`,
     `Circuit: ${formatState(state)}`,
@@ -436,59 +638,334 @@ function stateFromBranch(ctx) {
   for (const entry of ctx.sessionManager.getBranch()) {
     if (entry.type === "custom" && entry.customType === STATE_ENTRY_TYPE) latest = entry.data;
   }
-  return normalizeState(latest?.state ?? latest);
+  return latest;
 }
 
-function resultText(text, state) {
+function tokenizeCommandArguments(value) {
+  const input = String(value ?? "");
+  const tokens = [];
+  let token = "";
+  let quote = null;
+  let escaped = false;
+  for (const character of input) {
+    if (escaped) {
+      token += character;
+      escaped = false;
+    } else if (character === "\\") {
+      escaped = true;
+    } else if (quote) {
+      if (character === quote) quote = null;
+      else token += character;
+    } else if (character === "\"" || character === "'") {
+      quote = character;
+    } else if (/\s/u.test(character)) {
+      if (token) {
+        tokens.push(token);
+        token = "";
+      }
+    } else token += character;
+  }
+  if (escaped || quote) throw new Error("Unterminated escape or quote in command arguments.");
+  if (token) tokens.push(token);
+  return tokens;
+}
+
+const MODEL_COMMAND_ACTIONS = new Set(["configure", "auto", "status", "reset", "set"]);
+const MODEL_COMMAND_VALUE_OPTIONS = new Set([
+  "planner-mode", "planner", "planner-thinking",
+  "luna", "luna-thinking", "validator", "validator-thinking", "sol",
+]);
+
+function parseModelCommandArguments(value) {
+  const tokens = tokenizeCommandArguments(value);
+  const action = tokens[0] && MODEL_COMMAND_ACTIONS.has(tokens[0]) ? tokens.shift() : "configure";
+  const options = {};
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    if (token === "--force") {
+      if (options.force) throw new Error("Duplicate option --force.");
+      options.force = true;
+      continue;
+    }
+    if (!token.startsWith("--")) throw new Error(`Unexpected argument: ${token}.`);
+    const key = token.slice(2);
+    if (!MODEL_COMMAND_VALUE_OPTIONS.has(key)) throw new Error(`Unknown option: --${key}.`);
+    if (Object.hasOwn(options, key)) throw new Error(`Duplicate option: --${key}.`);
+    const optionValue = tokens[index + 1];
+    if (!optionValue || optionValue.startsWith("--")) throw new Error(`Option --${key} requires a value.`);
+    options[key] = optionValue;
+    index += 1;
+  }
+  return { action, options };
+}
+
+function candidateFromReference(reference) {
+  if (typeof reference !== "string") return null;
+  const separator = reference.indexOf("/");
+  if (separator <= 0 || separator === reference.length - 1) return null;
+  return { provider: reference.slice(0, separator), model: reference.slice(separator + 1) };
+}
+
+function requireConfiguredModel(models, reference, optionName) {
+  const candidate = candidateFromReference(reference);
+  const model = candidate ? modelByReference(models, modelReference(candidate)) : null;
+  if (!model) throw new Error(`${optionName} must reference an authenticated available model as provider/model.`);
+  return { candidate, model };
+}
+
+function selectedThinking(model, value, fallback, optionName, { allowFutureModel = false, ctx } = {}) {
+  const pinned = scopedThinkingLevel(ctx, model);
+  const thinking = value ?? (allowFutureModel ? (pinned ?? fallback) : clampThinking(model, fallback, ctx));
+  if (!THINKING_LEVELS.includes(thinking)) {
+    throw new Error(`${optionName} must be one of: ${THINKING_LEVELS.join(", ")}.`);
+  }
+  if (pinned && thinking !== pinned) {
+    throw new Error(`${optionName} must be ${pinned} because the current Pi model scope pins ${modelReference(candidateFromModel(model))} to that level.`);
+  }
+  if (!allowFutureModel && model && !supportedThinkingLevels(model).includes(thinking)) {
+    throw new Error(`${optionName}=${thinking} is not supported by ${modelReference(candidateFromModel(model))}. Supported levels: ${supportedThinkingLevels(model).join(", ")}.`);
+  }
+  return thinking;
+}
+
+function explicitModelRoutes(ctx, options) {
+  const models = availableProjectModels(ctx);
+  if (models.length === 0) throw new Error("No authenticated models are available for explicit Sol-Luna configuration.");
+  const plannerMode = options["planner-mode"] ?? "inherit";
+  if (!['inherit', 'route'].includes(plannerMode)) throw new Error("--planner-mode must be inherit or route.");
+  if (plannerMode === "route" && !options.planner) throw new Error("--planner is required when --planner-mode is route.");
+  if (plannerMode === "inherit" && options.planner) throw new Error("--planner is allowed only when --planner-mode is route.");
+  for (const role of WORKER_ROUTE_ROLES) {
+    if (!options[role]) throw new Error(`--${role} is required for /sol-luna-models set.`);
+  }
+  const planner = plannerMode === "route" ? requireConfiguredModel(models, options.planner, "--planner") : null;
+  const luna = requireConfiguredModel(models, options.luna, "--luna");
+  const validator = requireConfiguredModel(models, options.validator, "--validator");
+  const sol = requireConfiguredModel(models, options.sol, "--sol");
+  const solPinned = scopedThinkingLevel(ctx, sol.model);
+  if (!supportedThinkingLevels(sol.model).includes("high") || (solPinned && solPinned !== "high")) {
+    throw new Error(`--sol must reference a model that supports the fixed high recovery thinking level${solPinned ? `; the selected model is scope-pinned to ${solPinned}` : ""}.`);
+  }
+  return normalizeModelRoutes({
+    version: 2,
+    planner: {
+      mode: plannerMode,
+      thinking: selectedThinking(planner?.model ?? ctx.model, options["planner-thinking"], "high", "--planner-thinking", { allowFutureModel: plannerMode === "inherit", ctx }),
+      ...(planner ? { candidates: [planner.candidate] } : {}),
+    },
+    luna: {
+      thinking: selectedThinking(luna.model, options["luna-thinking"], "medium", "--luna-thinking", { ctx }),
+      candidates: [luna.candidate],
+    },
+    validator: {
+      thinking: selectedThinking(validator.model, options["validator-thinking"], "low", "--validator-thinking", { ctx }),
+      candidates: [validator.candidate],
+    },
+    sol: {
+      thinking: "high",
+      candidates: [sol.candidate],
+    },
+  });
+}
+
+async function selectModel(ctx, models, title, preferredReference) {
+  const references = models.map((model) => modelReference(candidateFromModel(model)));
+  const choices = preferredReference && references.includes(preferredReference)
+    ? [preferredReference, ...references.filter((reference) => reference !== preferredReference)]
+    : references;
+  const selected = await ctx.ui.select(title, choices);
+  return selected ? requireConfiguredModel(models, selected, title) : null;
+}
+
+async function selectThinking(ctx, title, model, preferred) {
+  const pinned = scopedThinkingLevel(ctx, model);
+  const supported = pinned ? [pinned] : supportedThinkingLevels(model);
+  const choices = supported.includes(preferred)
+    ? [preferred, ...supported.filter((level) => level !== preferred)]
+    : supported;
+  return ctx.ui.select(title, choices);
+}
+
+function routesSummary(config) {
+  const planner = config.planner.mode === "inherit"
+    ? `planner=inherit thinking=${config.planner.thinking}`
+    : `planner=${modelReference(config.planner.candidates[0])} thinking=${config.planner.thinking}`;
+  return [
+    planner,
+    ...WORKER_ROUTE_ROLES.map((role) => `${role}=${modelReference(config[role].candidates[0])} thinking=${config[role].thinking}`),
+  ].join("\n");
+}
+
+async function interactiveModelRoutes(ctx) {
+  if (!ctx.hasUI) throw new Error("Interactive model configuration requires Pi TUI/RPC mode. Use /sol-luna-models set ... or /sol-luna-models auto instead.");
+  const models = availableProjectModels(ctx);
+  if (models.length === 0) throw new Error("No authenticated models are available. Configure a provider first.");
+  const paths = projectPaths(ctx.cwd);
+  let existing;
+  try {
+    existing = readModelRoutes(paths).config;
+  } catch {
+    existing = null;
+  }
+  const runtime = resolveProjectModels(ctx, existing ?? automaticModelRoutes(ctx)).config;
+  const modeLabel = await ctx.ui.select("Planner routing", [
+    runtime.planner.mode === "route" ? "route to explicit model" : "inherit current Pi model",
+    runtime.planner.mode === "route" ? "inherit current Pi model" : "route to explicit model",
+  ]);
+  if (!modeLabel) return null;
+  const plannerMode = modeLabel.startsWith("route") ? "route" : "inherit";
+  const planner = plannerMode === "route"
+    ? await selectModel(ctx, models, "Planner model", runtime.planner.candidates?.[0] ? modelReference(runtime.planner.candidates[0]) : null)
+    : null;
+  if (plannerMode === "route" && !planner) return null;
+  const plannerThinking = await selectThinking(ctx, "Planner thinking", planner?.model ?? ctx.model, runtime.planner.thinking);
+  if (!plannerThinking) return null;
+  const selections = {};
+  for (const role of WORKER_ROUTE_ROLES) {
+    const preferred = runtime[role]?.candidates?.[0] ? modelReference(runtime[role].candidates[0]) : null;
+    const roleModels = role === "sol"
+      ? models.filter((model) => supportedThinkingLevels(model).includes("high")
+          && (!scopedThinkingLevel(ctx, model) || scopedThinkingLevel(ctx, model) === "high"))
+      : models;
+    if (roleModels.length === 0) throw new Error("No authenticated model supports Sol Recovery's fixed high thinking level in the current scope.");
+    selections[role] = await selectModel(ctx, roleModels, `${role} model`, preferred);
+    if (!selections[role]) return null;
+    selections[role].thinking = role === "sol"
+      ? "high"
+      : await selectThinking(ctx, `${role} thinking`, selections[role].model, runtime[role]?.thinking);
+    if (!selections[role].thinking) return null;
+  }
+  return normalizeModelRoutes({
+    version: 2,
+    planner: {
+      mode: plannerMode,
+      thinking: plannerThinking,
+      ...(planner ? { candidates: [planner.candidate] } : {}),
+    },
+    ...Object.fromEntries(WORKER_ROUTE_ROLES.map((role) => [role, {
+      thinking: selections[role].thinking,
+      candidates: [selections[role].candidate],
+    }])),
+  });
+}
+
+function modelCommandUsage() {
+  return [
+    "/sol-luna-models                         Interactive configuration",
+    "/sol-luna-models status                  Show explicit routes and availability",
+    "/sol-luna-models auto [--force]          Generate recommended v2 routes",
+    "/sol-luna-models reset [--force]         Replace routes with auto-discovered recommendations",
+    "/sol-luna-models set --planner-mode inherit --luna provider/model --validator provider/model --sol provider/model [--force]",
+  ].join("\n");
+}
+
+function modelConfigurationStatus(ctx) {
+  const paths = projectPaths(ctx.cwd);
+  const explicit = readModelRoutes(paths);
+  let models = [];
+  let discoveryError = null;
+  try {
+    models = availableProjectModels(ctx);
+  } catch (error) {
+    discoveryError = error instanceof Error ? error.message : String(error);
+  }
+  let config = explicit.config;
+  if (!config && models.length > 0) config = automaticModelRoutes(ctx);
+  const current = candidateFromModel(ctx.model);
+  const lines = [
+    `Route source: ${explicit.config ? `${CONFIG_DIR_NAME}/${MODEL_ROUTES_FILE}` : "missing"}`,
+    `Current Pi model: ${current ? modelReference(current) : "(none)"}`,
+    `Authenticated eligible models: ${models.length}${Array.isArray(ctx.scopedModels) && ctx.scopedModels.length > 0 ? " (session scoped)" : ""}`,
+  ];
+  if (discoveryError) lines.push(`Model discovery: unavailable (${discoveryError})`);
+  if (!config) {
+    lines.push("No explicit or automatically discoverable route is available.");
+    return lines.join("\n");
+  }
+  const resolution = resolveProjectModels(ctx, config);
+  lines.push(
+    `Route version: ${config.version}${explicit.config ? "" : " (automatic preview)"}`,
+    `planner: ${config.version === 2 && config.planner.mode === "route" ? (resolution.selections.planner ? modelReference(resolution.selections.planner) : "(none)") : "inherit"} thinking=${resolution.roles.planner.thinking}`,
+    ...modelStatusLines(resolution),
+  );
+  return lines.join("\n");
+}
+
+function resultText(text, state, details = {}) {
   return {
     content: [{ type: "text", text }],
-    details: { state: normalizeState(state) },
+    details: { state: normalizeState(state), ...details },
   };
 }
 
 const SYSTEM_PROTOCOL = `
 
-## Sol-Luna Router Protocol
-- Sol is the primary orchestrator. Keep planning, coordination, and user communication in the parent session.
-- Luna is the default implementation worker. Delegate implementation to a new immediate Agent call with subagent_type "luna-worker", inherit_context false, and run_in_background false. Do not schedule the call or pass a model override: the selected provider/model is pinned in the managed agent frontmatter. Do not use direct parent edit/write tools.
-- Use bash in the parent only for read-only inspection or approved validation; never use bash redirection or scripts to bypass the parent write restriction.
-- Before a new task, call sol_luna_gate with action start_task and a useful task label. After Luna reports, run the approved acceptance and validation commands.
-- If implementation fails the approved acceptance criteria or validation, call sol_luna_gate with action luna_failed and an evidence-based reason. The first failure permits one more Luna implementation attempt. The second failure immediately opens the circuit.
-- When the circuit is open, do not call or resume luna-worker. Start exactly one new sol-worker Agent call for recovery; do not hot-switch an existing Luna session. The gate records this attempt before execution.
-- If Sol Recovery fails, call sol_luna_gate with action sol_failed and a reason, then ask the user to decide. If validation passes, call action passed.
-- sol_luna_gate has no model-callable reset action. Only the user may use /sol-luna-reset to reset this session's circuit.
-- Never bypass a blocked write or Agent call with bash. The gate is authoritative.
+${CACHE_FRIENDLY_PROTOCOL_PREFIX}
+
+## Sol-Luna Host Orchestration Protocol
+- The parent is the Root Planner: understand the goal, define acceptance criteria, schedule workers, and make the final decision. The parent must not edit or write project files.
+- Start each task with sol_luna_gate(action=start_task), then call sol_luna_prepare_worker before every managed Agent call. Pass the returned rendered_prompt as the worker task without rewriting it.
+- Luna is the default implementation worker. Validator is a new read-only worker for diff checks, tests, lint, and static analysis. A Luna or Sol success claim is not final until Validator passes.
+- After each Agent returns, call sol_luna_record_result with its exact JSON report, then record observed token/latency feedback with sol_luna_record_usage when available. Fast Validator failures escalate to Deep Validator before creating a Failure Snapshot. One failed deep Luna validation permits one new Luna retry; the second opens the circuit.
+- When the circuit opens, prepare and start exactly one new sol-worker call. Sol must consume the latest Failure Snapshot and inspect affected files rather than re-exploring the project.
+- Managed Agent calls must be immediate, inherit_context false, unscheduled, without resume or model overrides. Models and thinking levels are pinned by the project routing policy.
+- Parent bash is limited to read-only inspection or emergency compatibility validation and must never bypass write restrictions.
+- Only the user may run /sol-luna-reset. The router state, Context Envelope, Task Memory, and Failure Snapshot are authoritative.
 `;
 
 export function createPiAdapter(pi) {
+  const managedDispatches = new Map();
   const router = createRouterService({
     taskIdFactory: () => `task-${randomUUID()}`,
   });
-  const persistState = (previousState) => {
+  const persistState = (previousSnapshot) => {
     try {
       pi.appendEntry(STATE_ENTRY_TYPE, router.snapshot());
     } catch (error) {
-      if (previousState !== undefined) router.restore(previousState);
+      if (previousSnapshot !== undefined) router.restore(previousSnapshot);
       throw error;
     }
   };
 
   pi.on("session_start", (_event, ctx) => {
+    managedDispatches.clear();
     router.restore(stateFromBranch(ctx));
   });
 
   pi.on("before_agent_start", (_event, ctx) => {
-    if (!materialization(ctx.cwd)) return;
-    return { systemPrompt: `${_event.systemPrompt}${SYSTEM_PROTOCOL}\nCurrent gate state: ${formatState(router.getState())}` };
+    const runtimeState = managedRuntimeState(ctx.cwd);
+    if (runtimeState === "inactive") return;
+    if (runtimeState === "unsafe") {
+      return {
+        systemPrompt: `${_event.systemPrompt}\n\n## Sol-Luna Integrity Failure\nManaged files do not match the project marker. Do not run implementation workers or mutate files. Ask the user to run /sol-luna-update or /sol-luna-models reset --force.`,
+      };
+    }
+    const activeTools = typeof pi.getActiveTools === "function" ? pi.getActiveTools() : [];
+    if (activeTools.includes("sol_luna_validate") && !activeTools.includes("Agent")) {
+      return {
+        systemPrompt: `${_event.systemPrompt}\n\n## Validator Capability Boundary\nUse sol_luna_validate only for syntax, JSON, and Git diff/status checks. Project scripts, direct shell execution, and file mutation are unavailable; report when external CI/test evidence is still required.`,
+      };
+    }
+    return { systemPrompt: `${_event.systemPrompt}${SYSTEM_PROTOCOL}` };
   });
 
   pi.on("tool_call", (event, ctx) => {
-    if (!materialization(ctx.cwd)) return;
+    const runtimeState = managedRuntimeState(ctx.cwd);
+    if (runtimeState === "inactive") return;
+    if (runtimeState === "unsafe") {
+      if (["edit", "write", "bash", "Agent"].includes(event.toolName) || event.toolName.startsWith("sol_luna_")) {
+        return {
+          block: true,
+          reason: "Sol-Luna managed-file integrity verification failed. Run /sol-luna-update or /sol-luna-models reset --force before continuing.",
+        };
+      }
+      return;
+    }
 
-    if (event.toolName === "edit" || event.toolName === "write") {
+    if (["edit", "write", "bash"].includes(event.toolName)) {
       return {
         block: true,
-        reason: "Parent direct edit/write is blocked by pi-sol-luna-router. Delegate implementation to luna-worker or the one permitted sol-worker recovery. Bash must not be used to bypass this rule.",
+        reason: "Parent filesystem mutation and shell execution are blocked by pi-sol-luna-router. Use managed Luna/Sol workers for implementation and Validator for approved checks.",
       };
     }
 
@@ -496,49 +973,381 @@ export function createPiAdapter(pi) {
     const input = event.input ?? {};
     const agentType = typeof input.subagent_type === "string" ? input.subagent_type : "";
     const normalizedAgentType = agentType.trim().toLowerCase();
-    const managedAgent = normalizedAgentType === "luna-worker" || normalizedAgentType === "sol-worker";
-    if (managedAgent && input.schedule) {
-      return { block: true, reason: "Scheduled Sol/Luna worker calls are blocked because delayed execution can violate the current circuit state. Start the worker immediately." };
+    const roleByAgent = {
+      "luna-worker": "luna",
+      "validator-worker": "validator",
+      "sol-worker": "sol",
+    };
+    const managedRole = roleByAgent[normalizedAgentType];
+    if (!managedRole) {
+      return { block: true, reason: "Only prepared luna-worker, validator-worker, or sol-worker Agent calls are allowed while the Sol-Luna runtime is active." };
     }
-    if (managedAgent && typeof input.model === "string" && input.model.trim()) {
-      return { block: true, reason: `Model overrides are blocked for managed Sol/Luna workers. Edit ${CONFIG_DIR_NAME}/${MODEL_ROUTES_FILE} and run /sol-luna-update instead.` };
+    if (managedRole && input.schedule) {
+      return { block: true, reason: "Scheduled Sol/Luna/Validator calls are blocked because delayed execution can violate the current task state. Start the worker immediately." };
+    }
+    if (managedRole && typeof input.model === "string" && input.model.trim()) {
+      return { block: true, reason: `Model overrides are blocked for managed workers. Edit ${CONFIG_DIR_NAME}/${MODEL_ROUTES_FILE} and run /sol-luna-update instead.` };
+    }
+    if (managedRole && typeof input.thinking === "string" && input.thinking.trim()) {
+      return { block: true, reason: "Thinking overrides are blocked for managed workers; use the routed task complexity." };
+    }
+    if (managedRole && input.resume) {
+      return { block: true, reason: "Managed workers must be new isolated calls; resume and hot-switching are blocked." };
     }
     try {
+      const pending = router.getPendingRequest();
+      if (managedRole) {
+        if (!pending || pending.role !== managedRole) {
+          return { block: true, reason: `No prepared ${managedRole} request is pending. Call sol_luna_prepare_worker first.` };
+        }
+        if (pending.dispatched === true) {
+          return { block: true, reason: `Prepared ${managedRole} request ${pending.requestId} has already been dispatched.` };
+        }
+        const dispatched = router.markWorkerDispatched({ role: managedRole, requestId: pending.requestId });
+        if (!dispatched.allowed) return { block: true, reason: dispatched.reason };
+        persistState(dispatched.previousSnapshot);
+        input.prompt = pending.renderedPrompt;
+        input.model = pending.routing?.provider && pending.routing?.model
+          ? `${pending.routing.provider}/${pending.routing.model}`
+          : input.model;
+        input.thinking = pending.budget.thinking;
+        input.inherit_context = false;
+        input.run_in_background = false;
+        managedDispatches.set(event.toolCallId, {
+          role: managedRole,
+          requestId: pending.requestId,
+          validatorMode: pending.validatorMode,
+          taskId: pending.taskId,
+        });
+        return;
+      }
       const prepared = router.prepareAgentCall({ agentType, resume: Boolean(input.resume) });
       if (!prepared.allowed) return { block: true, reason: prepared.reason };
-      if (prepared.changed) persistState(prepared.previousState);
+      if (prepared.changed) persistState(prepared.previousSnapshot);
     } catch (error) {
       return { block: true, reason: error instanceof Error ? error.message : String(error) };
     }
   });
 
+  pi.on("tool_result", (event, ctx) => {
+    if (managedRuntimeState(ctx.cwd) === "inactive" || event.toolName !== "Agent") return;
+    const dispatched = managedDispatches.get(event.toolCallId);
+    if (!dispatched) return;
+    managedDispatches.delete(event.toolCallId);
+    const pending = router.getPendingRequest();
+    if (!pending || pending.requestId !== dispatched.requestId || pending.taskId !== dispatched.taskId) return;
+    if (!event.isError) return;
+    try {
+      const currentState = router.getState();
+      const reason = event.content?.find?.((part) => part?.type === "text")?.text ?? "Managed Agent execution failed.";
+      const update = dispatched.role === "validator"
+        ? router.recordValidation({
+            role: currentState.phase === "sol-recovery" ? "sol" : "luna",
+            requestId: dispatched.requestId,
+            report: {
+              passed: false,
+              reason,
+              current_error: { type: "agent_execution_failure", message: reason, log: reason },
+            },
+          })
+        : router.gate(currentState.phase === "sol-recovery" ? "sol_failed" : "luna_failed", {
+            reason,
+            errorLog: reason,
+          });
+      persistState(update.previousSnapshot);
+    } catch {
+      // Pi still reports the original Agent failure. State restoration remains available via session snapshot/reset.
+    }
+  });
+
+  pi.registerTool({
+    name: "sol_luna_validate",
+    label: "Sol-Luna Safe Validation",
+    description: "Run syntax-only or non-executing repository checks without project scripts, shell parsing, redirection, or arbitrary code loading.",
+    parameters: Type.Object({
+      check: StringEnum(["node-check", "json-check", "git-diff-check", "git-status"]),
+      path: Type.Optional(Type.String({ description: "Project-relative .js/.mjs/.cjs or JSON file for syntax-only checks." })),
+    }),
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      let command;
+      let baseArgs;
+      if (params.check === "git-diff-check") [command, baseArgs] = ["git", ["diff", "--check"]];
+      else if (params.check === "git-status") [command, baseArgs] = ["git", ["status", "--short"]];
+      else {
+        if (!params.path) throw new Error(`${params.check} requires a project-relative path.`);
+        const absolute = resolve(ctx.cwd, params.path);
+        const projectRelative = relative(ctx.cwd, absolute);
+        if (!projectRelative || projectRelative.startsWith("..") || isAbsolute(projectRelative)) {
+          throw new Error("Validation path must remain inside the current project.");
+        }
+        assertRegularPath(absolute, { allowMissing: false });
+        if (params.check === "node-check") {
+          if (!/\.(?:cjs|mjs|js)$/iu.test(absolute)) throw new Error("node-check accepts only .js, .mjs, or .cjs files.");
+          [command, baseArgs] = ["node", ["--check", absolute]];
+        } else {
+          if (!/\.json$/iu.test(absolute)) throw new Error("json-check accepts only .json files.");
+          JSON.parse(readFileSync(absolute, "utf8"));
+          return resultText(`${params.check}: valid`, router.getState(), { check: params.check, passed: true, path: projectRelative });
+        }
+      }
+      const result = await pi.exec(command, baseArgs, { signal, cwd: ctx.cwd });
+      const output = `${result.stdout ?? ""}${result.stderr ? `\n${result.stderr}` : ""}`.trim();
+      return resultText(`${params.check}: exit=${result.code}\n${output}`.trim(), router.getState(), {
+        check: params.check,
+        exitCode: result.code,
+        passed: result.code === 0,
+      });
+    },
+  });
+
   pi.registerTool({
     name: "sol_luna_gate",
     label: "Sol-Luna Gate",
-    description: "Track Sol-Luna implementation validation and enforce the two-failure recovery circuit.",
-    promptSnippet: "Track Luna validation and the Sol Recovery circuit",
+    description: "Start tasks, mark planning ready, and inspect runtime state. Validation outcomes must use sol_luna_record_result.",
+    promptSnippet: "Start a Sol-Luna task or inspect its runtime state",
     promptGuidelines: [
-      "Use sol_luna_gate at task start, after every failed approved Luna validation, and after final validation; do not invent a reset action.",
+      "Use sol_luna_gate with start_task before preparing the first worker, and use status when runtime state is uncertain.",
     ],
     parameters: Type.Object({
-      action: StringEnum(["start_task", "luna_failed", "passed", "sol_failed", "status"]),
+      action: StringEnum(["start_task", "plan_ready", "status"]),
       task_label: Type.Optional(Type.String({ description: "Short label for a new task." })),
       task_id: Type.Optional(Type.String({ description: "Stable task identifier for a new task." })),
+      objective: Type.Optional(Type.String({ description: "Task objective." })),
+      task_type: Type.Optional(Type.String({ description: "Stable task category used for feedback and model ranking." })),
+      acceptance: Type.Optional(Type.Array(Type.String(), { description: "Acceptance criteria." })),
+      constraints: Type.Optional(Type.Array(Type.String(), { description: "Task constraints." })),
+      complexity: Type.Optional(StringEnum(["low", "medium", "high"])),
       reason: Type.Optional(Type.String({ description: "Evidence for a validation or recovery failure." })),
     }),
-    async execute(_toolCallId, params) {
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      if (!["start_task", "plan_ready", "status"].includes(params.action)) {
+        throw new Error("Validation pass/failure actions must be recorded with sol_luna_record_result.");
+      }
       if (params.action === "status") {
         const state = router.getState();
-        return resultText(formatState(state), state);
+        return resultText(formatState(state), state, { memory: router.getMemory() });
+      }
+      let reasoningProfile;
+      if (params.action === "start_task") managedDispatches.clear();
+      if (params.action === "start_task" && ctx) {
+        const { config } = effectiveModelRoutes(ctx, projectPaths(ctx.cwd));
+        const plannerResolution = resolveProjectModels(ctx, config, { complexity: params.complexity ?? "medium" });
+        reasoningProfile = {
+          taskId: params.task_id,
+          complexity: params.complexity ?? "medium",
+          roles: {
+            planner: { thinking: plannerResolution.roles.planner.thinking },
+            luna: { thinking: plannerResolution.roles.luna.thinking },
+            validator: {
+              fast: { thinking: plannerResolution.roles.validator.thinking },
+              deep: {
+                thinking: clampThinking(
+                  plannerResolution.selections.validator
+                    ? ctx.modelRegistry?.find?.(
+                        plannerResolution.selections.validator.provider,
+                        plannerResolution.selections.validator.model,
+                      )
+                    : null,
+                  deepValidatorThinking(plannerResolution.roles.validator.thinking),
+                  ctx,
+                ),
+              },
+            },
+            sol: { thinking: plannerResolution.roles.sol.thinking },
+          },
+        };
+        const planner = plannerResolution.selections.planner;
+        if (planner && typeof pi.setModel === "function") {
+          const model = ctx.modelRegistry?.find?.(planner.provider, planner.model);
+          if (model && await pi.setModel(model) === false) throw new Error(`Planner model ${modelReference(planner)} has no configured authentication.`);
+        }
+        if (typeof pi.setThinkingLevel === "function") {
+          pi.setThinkingLevel(planner?.thinking ?? plannerResolution.roles.planner.thinking);
+        }
       }
       const update = router.gate(
         params.action,
         params.action === "start_task"
-          ? { taskId: params.task_id, taskLabel: params.task_label }
+          ? {
+              taskId: params.task_id,
+              taskLabel: params.task_label,
+              objective: params.objective,
+              taskType: params.task_type,
+              acceptance: params.acceptance,
+              constraints: params.constraints,
+              complexity: params.complexity,
+              reasoningProfile,
+            }
           : { reason: params.reason },
       );
-      persistState(update.previousState);
-      return resultText(`Gate updated: ${formatState(update.state)}`, update.state);
+      persistState(update.previousSnapshot);
+      return resultText(`Gate updated: ${formatState(update.state)}`, update.state, { memory: router.getMemory() });
+    },
+  });
+
+  pi.registerTool({
+    name: "sol_luna_prepare_worker",
+    label: "Prepare Sol-Luna Worker",
+    description: "Create the role-scoped Context Envelope, token budget, Failure Snapshot reference, and cache-friendly prompt for the next managed Agent call.",
+    promptSnippet: "Prepare the next Luna, Validator, or Sol worker request",
+    promptGuidelines: [
+      "Call sol_luna_prepare_worker immediately before every managed Agent call and pass rendered_prompt as the Agent task unchanged.",
+    ],
+    parameters: Type.Object({
+      role: StringEnum(["luna", "validator", "sol"]),
+      instruction: Type.String({ description: "Current task instruction for this worker." }),
+      complexity: Type.Optional(StringEnum(["low", "medium", "high"])),
+      validator_mode: Type.Optional(StringEnum(["fast", "deep"])),
+      max_input_tokens: Type.Optional(Type.Integer({ minimum: 256 })),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      let routing;
+      const effectiveComplexity = params.complexity ?? router.getReasoningProfile()?.complexity ?? "medium";
+      if (ctx) {
+        const { config } = effectiveModelRoutes(ctx, projectPaths(ctx.cwd));
+        const resolution = resolveProjectModels(ctx, config, {
+          complexity: effectiveComplexity,
+          taskType: router.getMemory().task.taskType ?? effectiveComplexity,
+          performanceStore: router.getModelPerformanceStore(),
+        });
+        routing = resolution.selections[params.role];
+        if (!routing) throw new Error(`No available model route for ${params.role}.`);
+      }
+      const update = router.prepareWorkerRequest({
+        role: params.role,
+        instruction: params.instruction,
+        complexity: params.complexity,
+        validatorMode: params.validator_mode,
+        maxInputTokens: params.max_input_tokens,
+        routing,
+      });
+      if (!update.allowed) {
+        return resultText(`Worker blocked: ${update.reason}`, update.state, { blocked: true, reason: update.reason });
+      }
+      persistState(update.previousSnapshot);
+      return resultText(update.request.renderedPrompt, update.state, {
+        request: update.request,
+        request_id: update.request.requestId,
+        context_id: update.request.contextId,
+        snapshot_id: update.request.snapshotId,
+        rendered_prompt: update.request.renderedPrompt,
+      });
+    },
+  });
+
+  pi.registerTool({
+    name: "sol_luna_record_result",
+    label: "Record Sol-Luna Result",
+    description: "Record the exact structured worker or Validator JSON result into Task/Artifact/Failure Memory and advance validation or recovery state.",
+    promptSnippet: "Record a Luna, Validator, or Sol structured result",
+    promptGuidelines: [
+      "Call sol_luna_record_result after every managed Agent result; do not summarize away failed test evidence or Failure Snapshot details.",
+    ],
+    parameters: Type.Object({
+      role: StringEnum(["luna", "validator", "sol"]),
+      report_json: Type.String({ description: "Exact JSON object returned by the worker." }),
+      request_id: Type.Optional(Type.String({ description: "Request ID returned by sol_luna_prepare_worker." })),
+      implementation_role: Type.Optional(StringEnum(["luna", "sol"], { description: "For Validator reports, which implementation is being validated." })),
+    }),
+    async execute(_toolCallId, params) {
+      let report;
+      try {
+        report = JSON.parse(params.report_json);
+        if (!isPlainObject(report)) throw new Error("report_json must contain one JSON object.");
+        report = validateWorkerOutput(params.role, report);
+      } catch (error) {
+        const malformed = error instanceof Error ? error : new Error(String(error));
+        const pending = router.getPendingRequest();
+        if (pending?.role === params.role && pending.dispatched === true) {
+          const currentState = router.getState();
+          const failure = params.role === "validator" && pending.validatorMode === "fast"
+            ? router.recordValidation({
+                role: currentState.phase === "sol-recovery" ? "sol" : "luna",
+                requestId: pending.requestId,
+                report: {
+                  passed: false,
+                  reason: `Invalid Fast Validator structured output: ${malformed.message}`,
+                  current_error: { type: "invalid_validator_output", message: malformed.message, log: malformed.stack ?? malformed.message },
+                },
+              })
+            : router.gate(currentState.phase === "sol-recovery" ? "sol_failed" : "luna_failed", {
+                reason: `Invalid ${params.role} structured output: ${malformed.message}`,
+                errorLog: malformed.stack ?? malformed.message,
+              });
+          persistState(failure.previousSnapshot);
+        }
+        throw malformed;
+      }
+
+      const update = params.role === "validator"
+        ? router.recordValidation({
+            role: params.implementation_role ?? (router.getState().phase === "sol-recovery" ? "sol" : "luna"),
+            report,
+            requestId: params.request_id,
+          })
+        : router.recordWorkerReport({ role: params.role, report, requestId: params.request_id });
+      persistState(update.previousSnapshot);
+      return resultText(`Result recorded: ${formatState(update.state)}`, update.state, {
+        memory: router.getMemory(),
+        failure_snapshot: router.getFailureSnapshot(),
+      });
+    },
+  });
+
+  pi.registerTool({
+    name: "sol_luna_record_usage",
+    label: "Record Sol-Luna Usage",
+    description: "Record bounded token, latency, success, and optional model-performance feedback for dynamic budgets and model ranking.",
+    promptSnippet: "Record observed worker usage feedback",
+    parameters: Type.Object({
+      request_id: Type.String(),
+      role: StringEnum(["luna", "validator", "sol"]),
+      input_tokens: Type.Integer({ minimum: 0 }),
+      output_tokens: Type.Integer({ minimum: 0 }),
+      latency_ms: Type.Optional(Type.Integer({ minimum: 0 })),
+      success: Type.Boolean(),
+      truncated: Type.Optional(Type.Boolean()),
+      validator_mode: Type.Optional(StringEnum(["fast", "deep"])),
+      provider: Type.Optional(Type.String()),
+      model: Type.Optional(Type.String()),
+      task_type: Type.Optional(Type.String()),
+      quality: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+      cost: Type.Optional(Type.Number({ minimum: 0 })),
+    }),
+    async execute(_toolCallId, params) {
+      const previousSnapshot = router.snapshot();
+      try {
+        router.recordUsageFeedback({
+          requestId: params.request_id,
+          role: params.role,
+          inputTokens: params.input_tokens,
+          outputTokens: params.output_tokens,
+          latencyMs: params.latency_ms,
+          success: params.success,
+          truncated: params.truncated,
+          validatorMode: params.validator_mode,
+          taskType: params.task_type,
+        });
+        if (params.provider && params.model) {
+          router.recordModelFeedback({
+            provider: params.provider,
+            model: params.model,
+            taskType: params.task_type ?? router.getMemory().task.taskType ?? "general",
+            success: params.success,
+            quality: params.quality ?? (params.success ? 1 : 0),
+            cost: params.cost ?? 0,
+            latencyMs: params.latency_ms ?? 0,
+            samples: 1,
+          });
+        }
+        persistState(previousSnapshot);
+      } catch (error) {
+        router.restore(previousSnapshot);
+        throw error;
+      }
+      return resultText(`Usage recorded: ${formatState(router.getState())}`, router.getState(), {
+        usage_feedback: router.getMemory().runtime.usageFeedback,
+      });
     },
   });
 
@@ -575,6 +1384,73 @@ export function createPiAdapter(pi) {
     },
   });
 
+  pi.registerCommand("sol-luna-models", {
+    description: "Interactively configure or automatically discover explicit Sol-Luna model routes",
+    getArgumentCompletions(prefix) {
+      const values = ["configure", "status", "auto", "auto --force", "reset", "reset --force", "set"];
+      const matches = values.filter((value) => value.startsWith(prefix));
+      return matches.length > 0 ? matches.map((value) => ({ value, label: value })) : null;
+    },
+    handler: async (args, ctx) => {
+      try {
+        const parsed = parseModelCommandArguments(args);
+        if (parsed.action === "status") {
+          if (Object.keys(parsed.options).length > 0) throw new Error("status does not accept options.");
+          notify(ctx, modelConfigurationStatus(ctx), "info");
+          return;
+        }
+        if (parsed.action === "configure" && Object.keys(parsed.options).some((key) => key !== "force")) {
+          throw new Error("configure accepts only --force.");
+        }
+        if (!requireTrusted(ctx)) return;
+        const paths = projectPaths(ctx.cwd);
+        const routeFileExists = readText(paths.modelRoutes) !== undefined;
+        let proposed;
+        if (parsed.action === "configure") {
+          proposed = await interactiveModelRoutes(ctx);
+          if (!proposed) {
+            notify(ctx, "Sol-Luna model configuration cancelled; no files were changed.", "info");
+            return;
+          }
+        } else if (parsed.action === "set") {
+          proposed = explicitModelRoutes(ctx, parsed.options);
+        } else {
+          if (Object.keys(parsed.options).some((key) => key !== "force")) {
+            throw new Error(`${parsed.action} accepts only --force.`);
+          }
+          proposed = automaticModelRoutes(ctx);
+        }
+
+        if (routeFileExists && !parsed.options.force) {
+          if (!ctx.hasUI) {
+            notify(ctx, `An explicit ${CONFIG_DIR_NAME}/${MODEL_ROUTES_FILE} already exists. Re-run with --force to replace it.`, "warning");
+            return;
+          }
+          const confirmed = await ctx.ui.confirm(
+            "Replace Sol-Luna model routes?",
+            `${routesSummary(proposed)}\n\nThis replaces ${CONFIG_DIR_NAME}/${MODEL_ROUTES_FILE} and re-renders managed workers.`,
+          );
+          if (!confirmed) {
+            notify(ctx, "Sol-Luna model configuration cancelled; no files were changed.", "info");
+            return;
+          }
+        } else if (ctx.hasUI && parsed.action === "configure") {
+          const confirmed = await ctx.ui.confirm("Create Sol-Luna model routes?", routesSummary(proposed));
+          if (!confirmed) {
+            notify(ctx, "Sol-Luna model configuration cancelled; no files were changed.", "info");
+            return;
+          }
+        }
+
+        await syncProject(pi, ctx, parsed.options.force === true, "Sol-Luna model configuration", {
+          modelRoutesOverride: proposed,
+        });
+      } catch (error) {
+        notify(ctx, `Sol-Luna model configuration failed: ${error instanceof Error ? error.message : String(error)}\n\n${modelCommandUsage()}`, "error");
+      }
+    },
+  });
+
   pi.registerCommand("sol-luna-remove", {
     description: "Remove only Sol-Luna-managed project files and settings",
     handler: async (args, ctx) => {
@@ -591,8 +1467,11 @@ export function createPiAdapter(pi) {
           notify(ctx, "Invalid Sol-Luna router marker; refusing removal to avoid deleting user files.", "error");
           return;
         }
+        const markerAgentNames = Object.keys(marker.managedFiles)
+          .map((relative) => relative.match(/^agents\/(.+)\.md$/u)?.[1])
+          .filter(Boolean);
         const modified = [];
-        for (const name of AGENT_NAMES) {
+        for (const name of markerAgentNames) {
           const path = join(paths.agentsDir, `${name}.md`);
           const content = readText(path);
           if (content === undefined) continue;
@@ -609,7 +1488,7 @@ export function createPiAdapter(pi) {
           const cleaned = removeManagedSubagents(subagents);
           if (JSON.stringify(cleaned) !== JSON.stringify(subagents)) writeAtomic(paths.subagents, jsonText(cleaned));
         }
-        for (const name of AGENT_NAMES) removeRegularFile(join(paths.agentsDir, `${name}.md`));
+        for (const name of markerAgentNames) removeRegularFile(join(paths.agentsDir, `${name}.md`));
         removeRegularFile(paths.marker);
         notify(ctx, `Removed Sol-Luna-managed agents and marker; ${CONFIG_DIR_NAME}/${MODEL_ROUTES_FILE} and unrelated project configuration were preserved.`, "success");
         await ctx.reload();
@@ -622,8 +1501,9 @@ export function createPiAdapter(pi) {
   pi.registerCommand("sol-luna-reset", {
     description: "Reset the current session's Sol-Luna circuit state",
     handler: async (_args, ctx) => {
+      managedDispatches.clear();
       const update = router.reset();
-      persistState(update.previousState);
+      persistState(update.previousSnapshot);
       notify(ctx, "Sol-Luna circuit reset for the current session only.", "info");
     },
   });
