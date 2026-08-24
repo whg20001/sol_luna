@@ -1,12 +1,16 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync,
+  closeSync,
   existsSync,
   lstatSync,
   mkdirSync,
+  openSync,
   readFileSync,
+  realpathSync,
   renameSync,
   unlinkSync,
+  watch,
   writeFileSync,
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
@@ -42,9 +46,22 @@ import {
 } from "../model-routing.js";
 import { CACHE_FRIENDLY_PROTOCOL_PREFIX, validateWorkerOutput } from "../prompt-protocol.js";
 import { createRouterService } from "../router-service.js";
+import {
+  formatProjectTokenShares,
+  initialProjectTokenState,
+  normalizeProjectTokenState,
+  projectTokenPercentages,
+  recordProjectTokenUsage,
+  resetProjectTokenTotals,
+  setProjectTokenVisibility,
+  tokenTotalFromUsage,
+  tokenTotalFromWorkerEvent,
+} from "../token-share.js";
 
 const AGENT_INSTALL_COMMAND = "pi install -l npm:@tintinweb/pi-subagents@0.16.1";
 const MODEL_ROUTES_FILE = "sol-luna-models.json";
+const TOKEN_UI_FILE = "sol-luna-ui.json";
+const TOKEN_UI_WIDGET = "sol-luna-token-ui";
 const AGENT_TEMPLATE_URLS = Object.freeze({
   "agents/luna-worker.md": new URL("../../templates/agents/luna-worker.md", import.meta.url),
   "agents/validator-worker.md": new URL("../../templates/agents/validator-worker.md", import.meta.url),
@@ -58,6 +75,8 @@ function projectPaths(cwd) {
     subagents: join(configDir, "subagents.json"),
     marker: join(configDir, "sol-luna-router.json"),
     modelRoutes: join(configDir, MODEL_ROUTES_FILE),
+    tokenUi: join(configDir, TOKEN_UI_FILE),
+    tokenUiLock: join(configDir, `.${TOKEN_UI_FILE}.lock`),
     luna: join(configDir, "agents", "luna-worker.md"),
     validator: join(configDir, "agents", "validator-worker.md"),
     sol: join(configDir, "agents", "sol-worker.md"),
@@ -135,6 +154,134 @@ function removeRegularFile(path) {
 
 function jsonText(value) {
   return `${JSON.stringify(value, null, 2)}\n`;
+}
+
+function projectIdentity(cwd) {
+  const resolved = resolve(cwd);
+  try {
+    return realpathSync(resolved);
+  } catch {
+    return resolved;
+  }
+}
+
+function readProjectTokenState(paths, { repairInvalid = false } = {}) {
+  const configStat = lstatOrUndefined(paths.configDir);
+  if (!configStat) return { state: initialProjectTokenState(), repaired: false };
+  if (configStat.isSymbolicLink() || !configStat.isDirectory()) {
+    throw new Error(`Refusing unsafe project configuration directory: ${paths.configDir}`);
+  }
+  const text = readText(paths.tokenUi);
+  if (text === undefined) return { state: initialProjectTokenState(), repaired: false };
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+    if (!isPlainObject(parsed)) throw new Error(`${paths.tokenUi} must contain a JSON object.`);
+    return { state: normalizeProjectTokenState(parsed), repaired: false };
+  } catch (error) {
+    if (!repairInvalid) {
+      if (error instanceof SyntaxError) throw new Error(`Invalid JSON in ${paths.tokenUi}: ${error.message}`);
+      throw error;
+    }
+    return {
+      state: initialProjectTokenState({ visible: isPlainObject(parsed) && parsed.visible === true }),
+      repaired: true,
+    };
+  }
+}
+
+function sleepSync(milliseconds) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+}
+
+function withProjectTokenLock(paths, callback) {
+  const deadline = Date.now() + 2000;
+  const owner = `${process.pid}:${randomUUID()}`;
+  let descriptor;
+  while (descriptor === undefined) {
+    let created = false;
+    try {
+      descriptor = openSync(paths.tokenUiLock, "wx", 0o600);
+      created = true;
+      writeFileSync(descriptor, `${owner}\n`, { encoding: "utf8" });
+    } catch (error) {
+      if (descriptor !== undefined) {
+        try { closeSync(descriptor); } catch {}
+        descriptor = undefined;
+      }
+      if (created) {
+        try { unlinkSync(paths.tokenUiLock); } catch {}
+      }
+      if (error?.code !== "EEXIST") throw error;
+      const stat = lstatOrUndefined(paths.tokenUiLock);
+      if (!stat) continue;
+      if (stat.isSymbolicLink() || !stat.isFile()) {
+        throw new Error(`Refusing unsafe project token lock: ${paths.tokenUiLock}`);
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(`Timed out waiting for project token lock: ${paths.tokenUiLock}. Remove it only after confirming no Pi process is updating this project.`);
+      }
+      sleepSync(10);
+    }
+  }
+  const assertOwnership = () => {
+    const currentOwner = readText(paths.tokenUiLock)?.trim();
+    if (currentOwner !== owner) throw new Error("Project token lock ownership was lost; refusing to write stale totals.");
+  };
+  try {
+    assertOwnership();
+    return callback(assertOwnership);
+  } finally {
+    closeSync(descriptor);
+    try {
+      if (readText(paths.tokenUiLock)?.trim() === owner) unlinkSync(paths.tokenUiLock);
+    } catch {
+      // Never remove a lock that was replaced by another process.
+    }
+  }
+}
+
+function mutateProjectTokenState(cwd, mutator, { repairInvalid = false } = {}) {
+  const paths = projectPaths(cwd);
+  assertDirectory(paths.configDir);
+  return withProjectTokenLock(paths, (assertOwnership) => {
+    const current = readProjectTokenState(paths, { repairInvalid });
+    const result = mutator(current.state);
+    const next = normalizeProjectTokenState(result?.state ?? result);
+    const changed = result?.changed !== false || current.repaired;
+    if (changed) {
+      assertOwnership();
+      writeAtomic(paths.tokenUi, jsonText(next));
+    }
+    return { state: next, changed, repaired: current.repaired };
+  });
+}
+
+function assistantMessageKey(ctx, message) {
+  const sessionFile = ctx.sessionManager?.getSessionFile?.() ?? "ephemeral";
+  return sha256(JSON.stringify({
+    sessionFile,
+    timestamp: message?.timestamp ?? null,
+    responseId: message?.responseId ?? null,
+    provider: message?.provider ?? null,
+    model: message?.model ?? null,
+  }));
+}
+
+function startTaskToolCalls(message) {
+  if (!Array.isArray(message?.content)) return [];
+  return message.content.filter((part) => (
+    part?.type === "toolCall"
+      && part.name === "sol_luna_gate"
+      && isPlainObject(part.arguments)
+      && part.arguments.action === "start_task"
+      && typeof part.id === "string"
+      && part.id
+  ));
+}
+
+function activeProjectTask(state) {
+  return Boolean(state?.taskId) && ["luna", "open", "sol-recovery"].includes(state.phase);
 }
 
 function sha256(value) {
@@ -624,6 +771,7 @@ function statusReport(pi, ctx, state) {
     ...routeLines,
     `Marker: ${markerLine}`,
     `${MODEL_ROUTES_FILE}: ${safePresence(paths.modelRoutes)}`,
+    `${TOKEN_UI_FILE}: ${safePresence(paths.tokenUi)}`,
     `luna-worker.md: ${safePresence(paths.luna)}`,
     `validator-worker.md: ${safePresence(paths.validator)}`,
     `sol-worker.md: ${safePresence(paths.sol)}`,
@@ -915,9 +1063,19 @@ ${CACHE_FRIENDLY_PROTOCOL_PREFIX}
 
 export function createPiAdapter(pi) {
   const managedDispatches = new Map();
+  const workerDispatchByAgentId = new Map();
+  const pendingPlannerUsage = new Map();
+  const eligiblePlannerMessages = new Set();
   const router = createRouterService({
     taskIdFactory: () => `task-${randomUUID()}`,
   });
+  let activeSession = null;
+  let tokenUiState = initialProjectTokenState();
+  let tokenWidgetTui = null;
+  let tokenWidgetInstalled = false;
+  let tokenUiWatcher = null;
+  let tokenUiWarning = null;
+
   const persistState = (previousSnapshot) => {
     try {
       pi.appendEntry(STATE_ENTRY_TYPE, router.snapshot());
@@ -927,9 +1085,219 @@ export function createPiAdapter(pi) {
     }
   };
 
+  const requestTokenWidgetRender = () => tokenWidgetTui?.requestRender?.();
+
+  const closeTokenUiWatcher = () => {
+    tokenUiWatcher?.close?.();
+    tokenUiWatcher = null;
+  };
+
+  const applyTokenWidget = (ctx) => {
+    if (!ctx?.ui?.setWidget) return;
+    if (ctx.mode !== "tui" || tokenUiState.visible !== true) {
+      if (tokenWidgetInstalled) ctx.ui.setWidget(TOKEN_UI_WIDGET, undefined);
+      tokenWidgetTui = null;
+      tokenWidgetInstalled = false;
+      return;
+    }
+    if (tokenWidgetInstalled) {
+      requestTokenWidgetRender();
+      return;
+    }
+    ctx.ui.setWidget(TOKEN_UI_WIDGET, (tui) => {
+      tokenWidgetTui = tui;
+      return {
+        render(width) {
+          if (!Number.isInteger(width) || width <= 0) return [];
+          const text = formatProjectTokenShares(tokenUiState);
+          const fitted = text.length > width ? text.slice(text.length - width) : text.padStart(width, " ");
+          return [fitted];
+        },
+        invalidate() {},
+      };
+    }, { placement: "belowEditor" });
+    tokenWidgetInstalled = true;
+  };
+
+  const warnTokenUiOnce = (ctx, error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    if (tokenUiWarning === message) return;
+    tokenUiWarning = message;
+    if (ctx?.hasUI && ctx.ui?.notify) {
+      notify(ctx, `Sol-Luna project token accounting is unavailable: ${message}`, "warning");
+    }
+  };
+
+  const startTokenUiWatcher = (ctx) => {
+    closeTokenUiWatcher();
+    if (ctx?.mode !== "tui" || typeof ctx.cwd !== "string") return;
+    try {
+      const paths = projectPaths(projectIdentity(ctx.cwd));
+      const stat = lstatOrUndefined(paths.configDir);
+      if (!stat) return;
+      if (stat.isSymbolicLink() || !stat.isDirectory()) {
+        throw new Error(`Refusing unsafe project configuration directory: ${paths.configDir}`);
+      }
+      tokenUiWatcher = watch(paths.configDir, { persistent: false }, (_eventType, filename) => {
+        if (String(filename ?? "") !== TOKEN_UI_FILE || !activeSession?.ctx) return;
+        refreshTokenUiState(activeSession.ctx);
+      });
+      tokenUiWatcher.on("error", (error) => warnTokenUiOnce(ctx, error));
+    } catch (error) {
+      warnTokenUiOnce(ctx, error);
+    }
+  };
+
+  const refreshTokenUiState = (ctx) => {
+    if (!ctx || typeof ctx.cwd !== "string") return false;
+    const projectId = projectIdentity(ctx.cwd);
+    try {
+      tokenUiState = readProjectTokenState(projectPaths(projectId)).state;
+      tokenUiWarning = null;
+      if (activeSession?.projectId === projectId) activeSession.ctx = ctx;
+      applyTokenWidget(ctx);
+      requestTokenWidgetRender();
+      return true;
+    } catch (error) {
+      tokenUiState = initialProjectTokenState();
+      applyTokenWidget(ctx);
+      warnTokenUiOnce(ctx, error);
+      return false;
+    }
+  };
+
+  const mutateActiveProjectTokens = (ctx, mutator) => {
+    if (!ctx || typeof ctx.cwd !== "string" || !ctx.isProjectTrusted?.()) return false;
+    const projectId = projectIdentity(ctx.cwd);
+    if (activeSession?.projectId && activeSession.projectId !== projectId) return false;
+    try {
+      const update = mutateProjectTokenState(projectId, mutator);
+      tokenUiState = update.state;
+      tokenUiWarning = null;
+      if (activeSession?.projectId === projectId) activeSession.ctx = ctx;
+      applyTokenWidget(ctx);
+      requestTokenWidgetRender();
+      return true;
+    } catch (error) {
+      warnTokenUiOnce(ctx, error);
+      return false;
+    }
+  };
+
+  const recordActiveProjectTokens = (ctx, { role, tokens, kind, key }) => {
+    if (!Number.isSafeInteger(tokens) || tokens <= 0) return false;
+    return mutateActiveProjectTokens(ctx, (state) => recordProjectTokenUsage(state, { role, tokens, kind, key }));
+  };
+
+  const findManagedDispatch = (role) => {
+    const pending = router.getPendingRequest();
+    if (!pending || pending.role !== role || pending.dispatched !== true) return null;
+    for (const [dispatchKey, dispatch] of [...managedDispatches.entries()].reverse()) {
+      if (dispatch.role !== role || dispatch.requestId !== pending.requestId || dispatch.taskId !== pending.taskId) continue;
+      if (activeSession?.projectId && dispatch.projectId !== activeSession.projectId) continue;
+      return { dispatchKey, dispatch };
+    }
+    return null;
+  };
+
+  const correlateWorkerStart = (event) => {
+    const role = {
+      "luna-worker": "luna",
+      "validator-worker": "validator",
+      "sol-worker": "sol",
+    }[event?.type];
+    if (!role || typeof event?.id !== "string" || !event.id) return;
+    const match = findManagedDispatch(role);
+    if (!match || event.description !== match.dispatch.expectedDescription) return;
+    match.dispatch.agentId = event.id;
+    workerDispatchByAgentId.set(event.id, match.dispatchKey);
+  };
+
+  const recordWorkerCompletion = (event) => {
+    const role = {
+      "luna-worker": "luna",
+      "validator-worker": "validator",
+      "sol-worker": "sol",
+    }[event?.type];
+    if (!role || typeof event?.id !== "string" || !event.id || !activeSession?.ctx) return;
+    const dispatchKey = workerDispatchByAgentId.get(event.id);
+    if (dispatchKey === undefined) return;
+    const match = { dispatchKey, dispatch: managedDispatches.get(dispatchKey) };
+    if (!match?.dispatch || match.dispatch.role !== role || match.dispatch.usageCounted === true) return;
+    if (match.dispatch.projectId !== activeSession.projectId) return;
+    const tokens = tokenTotalFromWorkerEvent(event);
+    if (!Number.isSafeInteger(tokens) || tokens <= 0) return;
+    const counted = recordActiveProjectTokens(activeSession.ctx, {
+      role,
+      tokens,
+      kind: "workerRuns",
+      key: `subagent:${event.id}`,
+    });
+    if (!counted) return;
+    match.dispatch.usageCounted = true;
+    match.dispatch.agentId = event.id;
+    workerDispatchByAgentId.set(event.id, match.dispatchKey);
+    if (match.dispatch.toolResultSeen === true) {
+      managedDispatches.delete(match.dispatchKey);
+      workerDispatchByAgentId.delete(event.id);
+    }
+  };
+
+  if (pi.events?.on) {
+    pi.events.on("subagents:started", correlateWorkerStart);
+    pi.events.on("subagents:completed", recordWorkerCompletion);
+    pi.events.on("subagents:failed", recordWorkerCompletion);
+  }
+
   pi.on("session_start", (_event, ctx) => {
     managedDispatches.clear();
+    workerDispatchByAgentId.clear();
+    pendingPlannerUsage.clear();
+    eligiblePlannerMessages.clear();
     router.restore(stateFromBranch(ctx));
+    if (typeof ctx?.cwd !== "string") {
+      activeSession = null;
+      tokenUiState = initialProjectTokenState();
+      return;
+    }
+    activeSession = { ctx, projectId: projectIdentity(ctx.cwd) };
+    refreshTokenUiState(ctx);
+    startTokenUiWatcher(ctx);
+  });
+
+  pi.on("session_shutdown", (_event, ctx) => {
+    if (ctx?.ui?.setWidget) ctx.ui.setWidget(TOKEN_UI_WIDGET, undefined);
+    tokenWidgetTui = null;
+    tokenWidgetInstalled = false;
+    closeTokenUiWatcher();
+    activeSession = null;
+    managedDispatches.clear();
+    workerDispatchByAgentId.clear();
+    pendingPlannerUsage.clear();
+    eligiblePlannerMessages.clear();
+  });
+
+  pi.on("message_end", (event, ctx) => {
+    const message = event?.message;
+    if (message?.role !== "assistant" || typeof ctx?.cwd !== "string") return;
+    const projectId = projectIdentity(ctx.cwd);
+    if (activeSession?.projectId !== projectId || managedRuntimeState(ctx.cwd) !== "ready") return;
+    const candidate = {
+      projectId,
+      key: `planner:${assistantMessageKey(ctx, message)}`,
+    };
+    if (activeProjectTask(router.getState())) eligiblePlannerMessages.add(candidate.key);
+    else for (const part of startTaskToolCalls(message)) pendingPlannerUsage.set(part.id, candidate);
+  });
+
+  pi.on("turn_end", (event, ctx) => {
+    const message = event?.message;
+    if (message?.role !== "assistant" || typeof ctx?.cwd !== "string") return;
+    const key = `planner:${assistantMessageKey(ctx, message)}`;
+    if (!eligiblePlannerMessages.delete(key)) return;
+    const tokens = tokenTotalFromUsage(message.usage);
+    if (!Number.isSafeInteger(tokens) || tokens <= 0) return;
+    recordActiveProjectTokens(ctx, { role: "planner", tokens, kind: "plannerMessages", key });
   });
 
   pi.on("before_agent_start", (_event, ctx) => {
@@ -1007,17 +1375,24 @@ export function createPiAdapter(pi) {
         if (!dispatched.allowed) return { block: true, reason: dispatched.reason };
         persistState(dispatched.previousSnapshot);
         input.prompt = pending.renderedPrompt;
+        input.description = `sol-luna ${managedRole} ${pending.requestId}`;
         input.model = pending.routing?.provider && pending.routing?.model
           ? `${pending.routing.provider}/${pending.routing.model}`
           : input.model;
         input.thinking = pending.budget.thinking;
         input.inherit_context = false;
         input.run_in_background = false;
-        managedDispatches.set(event.toolCallId, {
+        const dispatchKey = event.toolCallId ?? pending.requestId;
+        managedDispatches.set(dispatchKey, {
           role: managedRole,
           requestId: pending.requestId,
           validatorMode: pending.validatorMode,
           taskId: pending.taskId,
+          projectId: projectIdentity(ctx.cwd),
+          usageCounted: false,
+          toolResultSeen: false,
+          agentId: null,
+          expectedDescription: input.description,
         });
         return;
       }
@@ -1033,7 +1408,11 @@ export function createPiAdapter(pi) {
     if (managedRuntimeState(ctx.cwd) === "inactive" || event.toolName !== "Agent") return;
     const dispatched = managedDispatches.get(event.toolCallId);
     if (!dispatched) return;
-    managedDispatches.delete(event.toolCallId);
+    dispatched.toolResultSeen = true;
+    if (dispatched.usageCounted === true) {
+      managedDispatches.delete(event.toolCallId);
+      if (dispatched.agentId) workerDispatchByAgentId.delete(dispatched.agentId);
+    }
     const pending = router.getPendingRequest();
     if (!pending || pending.requestId !== dispatched.requestId || pending.taskId !== dispatched.taskId) return;
     if (!event.isError) return;
@@ -1120,6 +1499,8 @@ export function createPiAdapter(pi) {
       reason: Type.Optional(Type.String({ description: "Evidence for a validation or recovery failure." })),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const pendingPlannerCandidate = params.action === "start_task" ? pendingPlannerUsage.get(_toolCallId) : null;
+      if (_toolCallId) pendingPlannerUsage.delete(_toolCallId);
       if (!["start_task", "plan_ready", "status"].includes(params.action)) {
         throw new Error("Validation pass/failure actions must be recorded with sol_luna_record_result.");
       }
@@ -1128,7 +1509,10 @@ export function createPiAdapter(pi) {
         return resultText(formatState(state), state, { memory: router.getMemory() });
       }
       let reasoningProfile;
-      if (params.action === "start_task") managedDispatches.clear();
+      if (params.action === "start_task") {
+        managedDispatches.clear();
+        workerDispatchByAgentId.clear();
+      }
       if (params.action === "start_task" && ctx) {
         const { config } = effectiveModelRoutes(ctx, projectPaths(ctx.cwd));
         const plannerResolution = resolveProjectModels(ctx, config, { complexity: params.complexity ?? "medium" });
@@ -1181,6 +1565,9 @@ export function createPiAdapter(pi) {
           : { reason: params.reason },
       );
       persistState(update.previousSnapshot);
+      if (pendingPlannerCandidate && ctx && pendingPlannerCandidate.projectId === projectIdentity(ctx.cwd)) {
+        eligiblePlannerMessages.add(pendingPlannerCandidate.key);
+      }
       return resultText(`Gate updated: ${formatState(update.state)}`, update.state, { memory: router.getMemory() });
     },
   });
@@ -1447,6 +1834,63 @@ export function createPiAdapter(pi) {
         });
       } catch (error) {
         notify(ctx, `Sol-Luna model configuration failed: ${error instanceof Error ? error.message : String(error)}\n\n${modelCommandUsage()}`, "error");
+      }
+    },
+  });
+
+  pi.registerCommand("sol-luna-token-ui", {
+    description: "Toggle or inspect current-project Sol-Luna token-share visualization",
+    getArgumentCompletions(prefix) {
+      const values = ["on", "off", "status", "reset"];
+      const matches = values.filter((value) => value.startsWith(prefix));
+      return matches.length > 0 ? matches.map((value) => ({ value, label: value })) : null;
+    },
+    handler: async (args, ctx) => {
+      const tokens = tokenizeCommandArguments(args);
+      if (tokens.length !== 1 || !["on", "off", "status", "reset"].includes(tokens[0])) {
+        notify(ctx, "Usage: /sol-luna-token-ui on|off|status|reset", "error");
+        return;
+      }
+      const action = tokens[0];
+      const projectId = projectIdentity(ctx.cwd);
+      const paths = projectPaths(projectId);
+      if (action === "status") {
+        try {
+          const state = readProjectTokenState(paths).state;
+          const percentages = projectTokenPercentages(state);
+          notify(ctx, [
+            `Sol-Luna token UI: ${state.visible ? "on" : "off"}`,
+            `Scope: current project only (${projectId})`,
+            `Tokens: P=${state.tokens.planner}, L=${state.tokens.luna}, V=${state.tokens.validator}, S=${state.tokens.sol}`,
+            `Shares: P(${percentages.planner}%),L(${percentages.luna}%),V(${percentages.validator}%),S(${percentages.sol}%)`,
+            `State file: ${paths.tokenUi}`,
+            `Rendering: ${ctx.mode === "tui" ? "available in this TUI" : "TUI-only (not rendered in this mode)"}`,
+          ].join("\n"), "info");
+        } catch (error) {
+          notify(ctx, `Sol-Luna token UI status failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+        }
+        return;
+      }
+      if (!requireTrusted(ctx)) return;
+      try {
+        const update = mutateProjectTokenState(projectId, (state) => (
+          action === "reset"
+            ? resetProjectTokenTotals(state)
+            : setProjectTokenVisibility(state, action === "on")
+        ), { repairInvalid: action === "reset" });
+        if (!activeSession || activeSession.projectId === projectId) {
+          tokenUiState = update.state;
+          activeSession = { ctx, projectId };
+          startTokenUiWatcher(ctx);
+          applyTokenWidget(ctx);
+          requestTokenWidgetRender();
+        }
+        const message = action === "reset"
+          ? `Reset Sol-Luna token totals for the current project only${update.repaired ? " and repaired the malformed project token file" : ""}; visibility remains ${update.state.visible ? "on" : "off"}. /sol-luna-reset still resets only the session circuit.`
+          : `Sol-Luna token-share visualization ${action === "on" ? "enabled" : "disabled"} for the current project. Accounting remains project-local and continues while hidden.`;
+        notify(ctx, message, "success");
+      } catch (error) {
+        notify(ctx, `Sol-Luna token UI update failed: ${error instanceof Error ? error.message : String(error)}`, "error");
       }
     },
   });

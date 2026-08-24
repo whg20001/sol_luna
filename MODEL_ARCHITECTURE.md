@@ -1081,6 +1081,7 @@ sol_luna_record_usage
 /sol-luna-models auto [--force]
 /sol-luna-models reset [--force]
 /sol-luna-models set ... [--force]
+/sol-luna-token-ui on|off|status|reset
 /sol-luna-status
 /sol-luna-remove
 /sol-luna-reset
@@ -1127,6 +1128,36 @@ Fast 失败时再次准备 Deep Validator；Deep 失败后由状态机决定 Lun
 - Agent `tool_result` 的迟到结果必须同时匹配 request ID 和 task ID；手工调用 `sol_luna_record_result` 时仍应显式提供 request ID。
 
 Pi 状态通过 `pi.appendEntry("pi-sol-luna-router/state", snapshot)` 写入 Session branch，并在 `session_start` 恢复最新条目。
+
+### 18.6 当前项目 Token 占比
+
+Pi TUI 可选地在输入框下方右对齐显示：
+
+```text
+P(…%),L(…%),V(…%),S(…%)
+```
+
+该统计严格属于当前正在使用的项目，不读取或分摊 Pi 全局 Token 总量：
+
+- 项目标识使用规范化后的当前项目路径。
+- 同一项目跨 Session、跨任务累计。
+- 切换项目后读取该项目独立的 `.pi/sol-luna-ui.json`。
+- 新任务和 `/sol-luna-reset` 不清零项目累计值。
+- `/sol-luna-token-ui reset` 只清零当前项目，并保留可见性与事件去重历史；显式 reset 也可修复格式损坏的普通 JSON 文件，但仍拒绝符号链接或不安全目录。
+- `/sol-luna-remove` 不删除用户拥有的 Token 统计文件。
+
+角色归属：
+
+| 标签 | 统计来源 |
+|---|---|
+| P | 活跃 Sol-Luna 任务期间 Root Planner 的 Pi `message_end` usage |
+| L | 已关联托管 dispatch 的 `luna-worker` lifecycle usage |
+| V | 已关联托管 dispatch 的 Fast/Deep `validator-worker` lifecycle usage |
+| S | 已关联托管 dispatch 的 `sol-worker` lifecycle usage |
+
+计数公式为 `input + output + cacheWrite`，明确排除 `cacheRead`。Worker 调度时注入包含 request ID 的确定性 description，并使用 pi-subagents 的 `subagents:started` 将该 description、agent type 与当前 pending request 三者关联；后续只接受同一 Agent ID 的 `subagents:completed`/`subagents:failed`，每个 Agent ID 只记一次，不能仅凭 agent type 或 `sol_luna_record_usage` 计费。Planner 使用 Assistant message 摘要去重；包含 `start_task` 的首条 Planner 消息只在 Gate 成功并持久化后提交。
+
+显示百分比使用最大余数法稳定分配整数百分点；非零总量时四项之和恒为 100。项目文件更新通过带随机 owner 标识的短期排他锁串行化 read-modify-write，写入前再次校验 lock ownership，并使用原子 rename；TUI 监听当前项目文件变化，因此同一项目的其他 Pi Session 更新也会刷新显示。可视化默认关闭，但项目计数在隐藏期间继续。实现使用 `setWidget(..., { placement: "belowEditor" })`，不替换 Footer 或 Editor，非 TUI 模式只保留配置和统计。
 
 ## 19. Generic / Codex / DeepSeek Harness
 
@@ -1217,12 +1248,13 @@ Snapshot 外层格式：
 | `src/context-envelope.js` | Context Envelope、角色投影、规范序列化 |
 | `src/prompt-protocol.js` | v2.1 固定 Prefix、Runtime Suffix、严格 JSON Schema |
 | `src/token-budget.js` | Token 估算、复杂度预算、反馈调整和上下文压缩 |
+| `src/token-share.js` | 当前项目 Token 累计、事件去重、占比舍入和显示格式 |
 | `src/semantic-memory.js` | 语义条目、确定性词法检索和 scorer 插件 |
 | `src/model-ranking.js` | 模型性能聚合、评分和稳定候选排名 |
 | `src/runtime-events.js` | 14 类有界生命周期事件和非致命 sink |
 | `src/model-routing.js` | v1/v2 路由归一化、精确模型选择和模板渲染 |
 | `src/router-service.js` | 策略、Memory、预算、模型、事件和调用生命周期总编排 |
-| `src/adapters/pi.js` | Pi 物化、工具、命令、权限门控和 Session 持久化 |
+| `src/adapters/pi.js` | Pi 物化、工具、命令、权限门控、Session 持久化和项目 Token TUI |
 | `src/adapters/harness.js` | Generic Harness 事务、Worker 调用和持久化回滚 |
 | `src/adapters/codex.js` | Codex Harness 薄封装 |
 | `src/adapters/deepseek.js` | DeepSeek Harness 薄封装 |

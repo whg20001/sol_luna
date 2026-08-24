@@ -301,6 +301,7 @@ Legacy v1 two-agent markers are recognized and safely upgraded when their record
 - `/sol-luna-models auto [--force]`
 - `/sol-luna-models reset [--force]`
 - `/sol-luna-models set ... [--force]`
+- `/sol-luna-token-ui on|off|status|reset`
 - `/sol-luna-status`
 - `/sol-luna-remove [--force]`
 - `/sol-luna-reset`
@@ -351,6 +352,34 @@ It presents authenticated models through Pi's UI and lets the user explicitly se
 Use `/sol-luna-models status` to inspect current routes. `/sol-luna-models auto` creates recommended routes and `/sol-luna-models reset` explicitly replaces an existing file with newly discovered recommendations. Existing files require UI confirmation or `--force` before replacement.
 
 The generated file remains a normal explicit configuration for reproducibility. Advanced users can still edit it directly.
+
+## Project token-share visualization
+
+The optional TUI visualization shows cumulative Sol-Luna token shares for the **current project only**:
+
+```text
+P(18%),L(52%),V(20%),S(10%)
+```
+
+- `P` — Root Planner usage while orchestrating a Sol-Luna task.
+- `L` — managed `luna-worker` usage.
+- `V` — managed Fast and Deep `validator-worker` usage combined.
+- `S` — managed `sol-worker` recovery usage.
+
+Each role uses `input + output + cacheWrite`; `cacheRead` is deliberately excluded so repeated cached-prefix reads do not distort the shares. Percentages use stable integer rounding and sum to 100 when any project usage exists. If no usage has been recorded, every role displays `0%`.
+
+The visualization is off by default. It renders as a right-aligned line immediately below the editor and never replaces Pi's built-in footer or editor:
+
+```text
+/sol-luna-token-ui on
+/sol-luna-token-ui off
+/sol-luna-token-ui status
+/sol-luna-token-ui reset
+```
+
+Accounting remains active while the visualization is hidden. Totals persist in `.pi/sol-luna-ui.json`, are isolated by the canonical current-project path, continue across sessions and tasks in that project, and never use Pi's global token totals. Updates use an ownership-tagged project-local lock plus atomic replacement, and an active TUI watches the file so another Pi session in the same project can refresh the displayed shares. `reset` clears only the current project's P/L/V/S counters while preserving visibility and replay-deduplication history; it can also explicitly repair malformed project token JSON without following unsafe paths. It is intentionally separate from `/sol-luna-reset`, which resets only the current session's routing circuit. `/sol-luna-remove` preserves the project token file.
+
+Planner totals are staged at Pi `message_end` and committed from the final `turn_end` assistant usage. Worker dispatches receive a request-specific description and are counted only when pi-subagents lifecycle events match that description, managed role, pending request, and Agent ID. The UI therefore does not rely on the model calling `sol_luna_record_usage`, which remains dedicated to budget and performance feedback.
 
 Version 1 route files remain supported:
 
@@ -524,6 +553,6 @@ npm run check
 npm pack --dry-run
 ```
 
-The current v2.1 suite contains 102 tests when Pi peer dependencies are available. Pi integration tests skip cleanly in a host-independent install without those peers.
+The current v2.1 suite contains 111 tests when Pi peer dependencies are available. Pi integration tests skip cleanly in a host-independent install without those peers.
 
 For the complete design, compatibility matrix, security boundaries, and lifecycle specification, see [`MODEL_ARCHITECTURE.md`](./MODEL_ARCHITECTURE.md).

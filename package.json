@@ -69,7 +69,7 @@
   },
   "scripts": {
     "test": "node --test",
-    "check": "node --check src/index.js && node --check src/core.js && node --check src/context-envelope.js && node --check src/task-memory.js && node --check src/prompt-protocol.js && node --check src/token-budget.js && node --check src/execution-policy.js && node --check src/semantic-memory.js && node --check src/model-ranking.js && node --check src/runtime-events.js && node --check src/model-routing.js && node --check src/router-service.js && node --check src/adapters/pi.js && node --check src/adapters/harness.js && node --check src/adapters/codex.js && node --check src/adapters/deepseek.js && node --check examples/codex-harness.mjs && node --check examples/deepseek-harness.mjs && npm test"
+    "check": "node --check src/index.js && node --check src/core.js && node --check src/context-envelope.js && node --check src/task-memory.js && node --check src/prompt-protocol.js && node --check src/token-budget.js && node --check src/token-share.js && node --check src/execution-policy.js && node --check src/semantic-memory.js && node --check src/model-ranking.js && node --check src/runtime-events.js && node --check src/model-routing.js && node --check src/router-service.js && node --check src/adapters/pi.js && node --check src/adapters/harness.js && node --check src/adapters/codex.js && node --check src/adapters/deepseek.js && node --check examples/codex-harness.mjs && node --check examples/deepseek-harness.mjs && npm test"
   },
   "license": "MIT"
 }

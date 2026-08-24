@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -60,6 +60,7 @@ function createFakePi() {
   const events = new Map();
   const tools = new Map();
   const commands = new Map();
+  const sharedEvents = new Map();
   const entries = [];
   let failAppend = false;
   let agentToolPresent = true;
@@ -69,6 +70,17 @@ function createFakePi() {
     on(name, handler) { events.set(name, handler); },
     registerTool(tool) { tools.set(tool.name, tool); },
     registerCommand(name, command) { commands.set(name, command); },
+    events: {
+      on(name, handler) {
+        const handlers = sharedEvents.get(name) ?? new Set();
+        handlers.add(handler);
+        sharedEvents.set(name, handlers);
+        return () => handlers.delete(handler);
+      },
+      emit(name, data) {
+        for (const handler of sharedEvents.get(name) ?? []) handler(data);
+      },
+    },
     appendEntry(type, data) {
       if (failAppend) throw new Error("session store unavailable");
       entries.push({ type, data });
@@ -80,6 +92,7 @@ function createFakePi() {
   };
   return {
     pi, events, tools, commands, entries, thinkingLevels, selectedModels,
+    emitShared(name, data) { pi.events.emit(name, data); },
     setFailAppend(value) { failAppend = value; },
     setAgentToolPresent(value) { agentToolPresent = value; },
   };
@@ -90,8 +103,10 @@ function commandContext(root, notifications = [], overrides = {}) {
     { provider: "openai", id: "gpt-5.6-luna" },
     { provider: "openai", id: "gpt-5.6-sol" },
   ];
+  const widgets = overrides.widgets ?? new Map();
   return {
     cwd: root,
+    mode: overrides.mode ?? "print",
     hasUI: overrides.hasUI ?? false,
     isProjectTrusted: () => true,
     model: overrides.model,
@@ -100,10 +115,18 @@ function commandContext(root, notifications = [], overrides = {}) {
       getAvailable: () => available,
       find: (provider, id) => available.find((model) => model.provider === provider && model.id === id),
     },
+    sessionManager: overrides.sessionManager ?? {
+      getBranch: () => [],
+      getSessionFile: () => join(root, "session.jsonl"),
+    },
     ui: {
       notify(message, level) { notifications.push({ message, level }); },
       select: overrides.select ?? (async () => undefined),
       confirm: overrides.confirm ?? (async () => false),
+      setWidget(name, factory, options) {
+        if (factory === undefined) widgets.delete(name);
+        else widgets.set(name, { factory, options });
+      },
     },
     async reload() { if (overrides.reload) await overrides.reload(); },
     ...overrides.context,
@@ -113,7 +136,7 @@ function commandContext(root, notifications = [], overrides = {}) {
 test("Pi adapter registers v2 tools and materializes Luna, Validator, and Sol", { skip: skipWithoutPiPeers }, async () => {
   const fake = createFakePi();
   piModule.createPiAdapter(fake.pi);
-  assert.deepEqual([...fake.events.keys()].sort(), ["before_agent_start", "session_start", "tool_call", "tool_result"]);
+  assert.deepEqual([...fake.events.keys()].sort(), ["before_agent_start", "message_end", "session_shutdown", "session_start", "tool_call", "tool_result", "turn_end"]);
   assert.deepEqual([...fake.tools.keys()].sort(), [
     "sol_luna_gate",
     "sol_luna_prepare_worker",
@@ -127,6 +150,7 @@ test("Pi adapter registers v2 tools and materializes Luna, Validator, and Sol", 
     "sol-luna-remove",
     "sol-luna-reset",
     "sol-luna-status",
+    "sol-luna-token-ui",
     "sol-luna-update",
   ]);
 
@@ -304,8 +328,9 @@ test("Pi gate creates Failure Snapshots and permits one prepared Sol call", { sk
   const root = mkdtempSync(join(tmpdir(), "sol-luna-pi-sol-"));
   try {
     await fake.commands.get("sol-luna-init").handler("", commandContext(root));
-    fake.events.get("session_start")({}, { sessionManager: { getBranch: () => [] } });
-    await fake.tools.get("sol_luna_gate").execute("start", { action: "start_task", task_id: "sol-task", task_label: "recover" });
+    const ctx = commandContext(root);
+    fake.events.get("session_start")({}, ctx);
+    await fake.tools.get("sol_luna_gate").execute("start", { action: "start_task", task_id: "sol-task", task_label: "recover" }, undefined, undefined, ctx);
     for (let attempt = 1; attempt <= 2; attempt += 1) {
       const luna = await fake.tools.get("sol_luna_prepare_worker").execute(`prepare-luna-${attempt}`, {
         role: "luna",
@@ -313,6 +338,8 @@ test("Pi gate creates Failure Snapshots and permits one prepared Sol call", { sk
       });
       const lunaInput = { subagent_type: "luna-worker" };
       assert.equal(fake.events.get("tool_call")({ toolName: "Agent", input: lunaInput }, { cwd: root }), undefined);
+      fake.emitShared("subagents:started", { id: `luna-agent-${attempt}`, type: "luna-worker", description: lunaInput.description });
+      fake.emitShared("subagents:completed", { id: `luna-agent-${attempt}`, type: "luna-worker", tokens: { total: 110 } });
       await fake.tools.get("sol_luna_record_result").execute(`record-luna-${attempt}`, {
         role: "luna",
         request_id: luna.details.request_id,
@@ -327,6 +354,8 @@ test("Pi gate creates Failure Snapshots and permits one prepared Sol call", { sk
       });
       const validatorInput = { subagent_type: "validator-worker" };
       assert.equal(fake.events.get("tool_call")({ toolName: "Agent", input: validatorInput }, { cwd: root }), undefined);
+      fake.emitShared("subagents:started", { id: `validator-fast-${attempt}`, type: "validator-worker", description: validatorInput.description });
+      fake.emitShared("subagents:completed", { id: `validator-fast-${attempt}`, type: "validator-worker", tokens: { total: 40 } });
       await fake.tools.get("sol_luna_record_result").execute(`record-validator-${attempt}`, {
         role: "validator",
         implementation_role: "luna",
@@ -345,6 +374,8 @@ test("Pi gate creates Failure Snapshots and permits one prepared Sol call", { sk
       });
       const deepInput = { subagent_type: "validator-worker" };
       assert.equal(fake.events.get("tool_call")({ toolName: "Agent", input: deepInput }, { cwd: root }), undefined);
+      fake.emitShared("subagents:started", { id: `validator-deep-${attempt}`, type: "validator-worker", description: deepInput.description });
+      fake.emitShared("subagents:completed", { id: `validator-deep-${attempt}`, type: "validator-worker", tokens: { total: 60 } });
       await fake.tools.get("sol_luna_record_result").execute(`record-deep-validator-${attempt}`, {
         role: "validator",
         implementation_role: "luna",
@@ -382,6 +413,10 @@ test("Pi gate creates Failure Snapshots and permits one prepared Sol call", { sk
     const input = { subagent_type: "sol-worker" };
     assert.equal(fake.events.get("tool_call")({ toolName: "Agent", input }, { cwd: root }), undefined);
     assert.equal(input.prompt, prepared.details.rendered_prompt);
+    fake.emitShared("subagents:started", { id: "sol-agent-1", type: "sol-worker", description: input.description });
+    fake.emitShared("subagents:completed", { id: "sol-agent-1", type: "sol-worker", tokens: { total: 300 } });
+    const tokenState = JSON.parse(readFileSync(join(root, configDirName, "sol-luna-ui.json"), "utf8"));
+    assert.deepEqual(tokenState.tokens, { planner: 0, luna: 220, validator: 200, sol: 300 });
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -659,6 +694,182 @@ test("interactive Pi model configuration writes selected explicit routes", { ski
     assert.equal(routes.luna.candidates[0].model, "one");
     assert.equal(routes.validator.candidates[0].model, "two");
     assert.equal(routes.sol.candidates[0].model, "three");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("project token UI is opt-in, right-aligned, persistent, and isolated by project", { skip: skipWithoutPiPeers }, async () => {
+  const fake = createFakePi();
+  piModule.createPiAdapter(fake.pi);
+  const firstRoot = mkdtempSync(join(tmpdir(), "sol-luna-token-ui-a-"));
+  const secondRoot = mkdtempSync(join(tmpdir(), "sol-luna-token-ui-b-"));
+  try {
+    await fake.commands.get("sol-luna-init").handler("", commandContext(firstRoot));
+    const notifications = [];
+    const widgets = new Map();
+    const ctx = commandContext(firstRoot, notifications, { mode: "tui", hasUI: true, widgets });
+    fake.events.get("session_start")({}, ctx);
+    assert.equal(widgets.has("sol-luna-token-ui"), false);
+
+    await fake.commands.get("sol-luna-token-ui").handler("on", ctx);
+    const widget = widgets.get("sol-luna-token-ui");
+    assert.equal(widget.options.placement, "belowEditor");
+    const component = widget.factory({ requestRender() {} });
+    const rendered = component.render(60)[0];
+    assert.equal(rendered.length, 60);
+    assert.equal(rendered.trim(), "P(0%),L(0%),V(0%),S(0%)");
+
+    const plannerMessage = {
+      role: "assistant",
+      provider: "openai",
+      model: "planner",
+      responseId: "planner-start",
+      timestamp: 123,
+      stopReason: "toolUse",
+      usage: { input: 100, output: 20, cacheWrite: 5, cacheRead: 100_000 },
+      content: [{
+        type: "toolCall",
+        id: "start-call",
+        name: "sol_luna_gate",
+        arguments: { action: "start_task" },
+      }],
+    };
+    fake.events.get("message_end")({ message: plannerMessage }, ctx);
+    await fake.tools.get("sol_luna_gate").execute("start-call", {
+      action: "start_task",
+      task_id: "project-token-task",
+      objective: "Track project tokens",
+    }, undefined, undefined, ctx);
+    fake.events.get("turn_end")({ message: plannerMessage }, ctx);
+    fake.events.get("message_end")({ message: plannerMessage }, ctx);
+    fake.events.get("turn_end")({ message: plannerMessage }, ctx);
+
+    let state = JSON.parse(readFileSync(join(firstRoot, configDirName, "sol-luna-ui.json"), "utf8"));
+    assert.equal(state.visible, true);
+    assert.equal(state.tokens.planner, 125);
+    assert.equal(state.seen.plannerMessages.length, 1);
+
+    await fake.commands.get("sol-luna-token-ui").handler("off", ctx);
+    assert.equal(widgets.has("sol-luna-token-ui"), false);
+    const nextPlannerMessage = {
+      ...plannerMessage,
+      responseId: "planner-next",
+      timestamp: 124,
+      content: [],
+      usage: { input: 20, output: 5, cacheWrite: 0, cacheRead: 50_000 },
+    };
+    fake.events.get("message_end")({ message: nextPlannerMessage }, ctx);
+    fake.events.get("turn_end")({ message: nextPlannerMessage }, ctx);
+    state = JSON.parse(readFileSync(join(firstRoot, configDirName, "sol-luna-ui.json"), "utf8"));
+    assert.equal(state.tokens.planner, 150);
+
+    const secondNotifications = [];
+    const secondCtx = commandContext(secondRoot, secondNotifications);
+    await fake.commands.get("sol-luna-token-ui").handler("status", secondCtx);
+    assert.match(secondNotifications.at(-1).message, /P=0, L=0, V=0, S=0/);
+
+    await fake.commands.get("sol-luna-token-ui").handler("reset", ctx);
+    state = JSON.parse(readFileSync(join(firstRoot, configDirName, "sol-luna-ui.json"), "utf8"));
+    assert.deepEqual(state.tokens, { planner: 0, luna: 0, validator: 0, sol: 0 });
+    assert.equal(state.visible, false);
+    assert.equal(state.seen.plannerMessages.length, 2);
+  } finally {
+    rmSync(firstRoot, { recursive: true, force: true });
+    rmSync(secondRoot, { recursive: true, force: true });
+  }
+});
+
+test("project token UI refuses untrusted writes and symlinked project configuration", { skip: skipWithoutPiPeers }, async () => {
+  const fake = createFakePi();
+  piModule.createPiAdapter(fake.pi);
+  const root = mkdtempSync(join(tmpdir(), "sol-luna-token-security-"));
+  const target = mkdtempSync(join(tmpdir(), "sol-luna-token-target-"));
+  try {
+    const notifications = [];
+    const untrusted = commandContext(root, notifications, {
+      context: { isProjectTrusted: () => false },
+    });
+    await fake.commands.get("sol-luna-token-ui").handler("on", untrusted);
+    assert.equal(notifications.at(-1).level, "error");
+    assert.throws(() => readFileSync(join(root, configDirName, "sol-luna-ui.json"), "utf8"), /ENOENT/);
+
+    const configDir = join(root, configDirName);
+    mkdirSync(configDir, { recursive: true });
+    writeFileSync(join(configDir, "sol-luna-ui.json"), "{invalid json\n");
+    const trusted = commandContext(root, notifications);
+    await fake.commands.get("sol-luna-token-ui").handler("reset", trusted);
+    assert.equal(notifications.at(-1).level, "success");
+    assert.match(notifications.at(-1).message, /repaired the malformed project token file/i);
+    assert.deepEqual(JSON.parse(readFileSync(join(configDir, "sol-luna-ui.json"), "utf8")).tokens, {
+      planner: 0, luna: 0, validator: 0, sol: 0,
+    });
+
+    rmSync(configDir, { recursive: true, force: true });
+    symlinkSync(target, configDir);
+    await fake.commands.get("sol-luna-token-ui").handler("on", trusted);
+    assert.equal(notifications.at(-1).level, "error");
+    assert.match(notifications.at(-1).message, /unsafe project configuration directory/i);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(target, { recursive: true, force: true });
+  }
+});
+
+test("managed worker lifecycle events add project-local token totals exactly once", { skip: skipWithoutPiPeers }, async () => {
+  const fake = createFakePi();
+  piModule.createPiAdapter(fake.pi);
+  const root = mkdtempSync(join(tmpdir(), "sol-luna-token-worker-"));
+  try {
+    await fake.commands.get("sol-luna-init").handler("", commandContext(root));
+    const ctx = commandContext(root);
+    fake.events.get("session_start")({}, ctx);
+    await fake.tools.get("sol_luna_gate").execute("start", {
+      action: "start_task",
+      task_id: "worker-token-task",
+      objective: "Track worker tokens",
+    }, undefined, undefined, ctx);
+    const prepared = await fake.tools.get("sol_luna_prepare_worker").execute("prepare", {
+      role: "luna",
+      instruction: "Implement token tracking",
+    }, undefined, undefined, ctx);
+    const input = { subagent_type: "luna-worker" };
+    assert.equal(fake.events.get("tool_call")({ toolName: "Agent", toolCallId: "agent-luna", input }, ctx), undefined);
+
+    fake.emitShared("subagents:started", { id: "unmanaged-luna", type: "luna-worker", description: "unmanaged same-role worker" });
+    fake.emitShared("subagents:completed", {
+      id: "unmanaged-luna",
+      type: "luna-worker",
+      tokens: { total: 9999 },
+    });
+    fake.emitShared("subagents:started", { id: "worker-luna-1", type: "luna-worker", description: input.description });
+    fake.emitShared("subagents:failed", {
+      id: "worker-luna-1",
+      type: "luna-worker",
+      usage: { input: 200, output: 30, cacheWrite: 10, cacheRead: 9999 },
+    });
+    fake.emitShared("subagents:failed", {
+      id: "worker-luna-1",
+      type: "luna-worker",
+      usage: { input: 200, output: 30, cacheWrite: 10, cacheRead: 9999 },
+    });
+    fake.emitShared("subagents:completed", {
+      id: "unmanaged",
+      type: "general-purpose",
+      usage: { input: 999, output: 999, cacheWrite: 999 },
+    });
+    fake.events.get("tool_result")({
+      toolName: "Agent",
+      toolCallId: "agent-luna",
+      isError: false,
+      content: [{ type: "text", text: "completed" }],
+    }, ctx);
+
+    const state = JSON.parse(readFileSync(join(root, configDirName, "sol-luna-ui.json"), "utf8"));
+    assert.equal(state.tokens.luna, 240);
+    assert.equal(state.seen.workerRuns.length, 1);
+    assert.equal(state.visible, false);
+    assert.equal(prepared.details.request.role, "luna");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
