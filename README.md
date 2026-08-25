@@ -290,10 +290,12 @@ Initialization creates or synchronizes:
 - `.pi/sol-luna-models.json`
 - `.pi/sol-luna-router.json`
 
-Legacy v1 two-agent markers are recognized and safely upgraded when their recorded files are unchanged. The v2 runtime remains inactive for a legacy materialization until `/sol-luna-update` creates the Validator template.
+The pause state is stored separately in `.pi/sol-luna-runtime.json`; an absent file means active, while `/sol-luna-disable` and `/sol-luna-enable` write explicit paused or active state. Legacy v1 two-agent markers are recognized and safely upgraded when their recorded files are unchanged. The v2 runtime remains inactive for a legacy materialization until `/sol-luna-update` creates the Validator template.
 
 ### Pi commands
 
+- `/sol-luna-disable` — pause orchestration for the current project without removing files or state
+- `/sol-luna-enable` — resume orchestration (and repair malformed regular runtime JSON)
 - `/sol-luna-init [--force]`
 - `/sol-luna-update [--force]`
 - `/sol-luna-models` — interactive model configuration wizard
@@ -327,6 +329,12 @@ The required Pi flow is:
 The adapter rewrites a managed Agent call to the exact prepared prompt, applies the routed model and thinking level, and blocks calls that are scheduled, resumed, model/thinking-overridden, unprepared, or dispatched twice. Managed agent templates intentionally omit fixed `model` and `thinking` frontmatter so pi-subagents uses these per-request routed values. Parent `edit`, `write`, and `bash` remain blocked.
 
 The extension adds only a static runtime protocol to the parent system prompt. Dynamic state is returned by tools rather than appended to the system prompt, improving cache stability.
+
+### Project pause/resume
+
+`/sol-luna-disable` writes the strict project-local `.pi/sol-luna-runtime.json` state `{ "version": 1, "paused": true }`. An absent file means active. While paused, Sol-Luna omits its system prompt, hides the token-share widget, stops Planner/worker project token accounting, and rejects `sol_luna_*` tools plus managed `luna-worker`, `validator-worker`, and `sol-worker` Agent dispatches with a resume hint. Ordinary unrelated Pi tools, Agent calls, and extensions continue normally. The router snapshot, managed files, model routes, token totals, and token UI visibility preference are preserved; transient dispatch correlations are cleared.
+
+`/sol-luna-enable` writes `{ "version": 1, "paused": false }` and restores normal orchestration. It explicitly repairs malformed regular runtime JSON, but never follows symlinks or accepts unsafe `.pi` directories. Init, update, remove, and reset do not erase the pause file. Status reports active, paused, or invalid runtime state. Invalid or unsafe runtime state fails closed for all Sol-Luna orchestration: every `sol_luna_*` tool and managed `luna-worker`, `validator-worker`, or `sol-worker` Agent dispatch is blocked, while ordinary unrelated Pi tools and Agent calls remain available. Runtime reads occur on session start and event boundaries. TUI sessions also watch the project configuration directory; runtime-file events refresh pause state, token-file events refresh token state, and watcher events with a `null` or `undefined` filename refresh both after atomic replacement.
 
 ## Model routing
 
@@ -553,6 +561,6 @@ npm run check
 npm pack --dry-run
 ```
 
-The current v2.1 suite contains 111 tests when Pi peer dependencies are available. Pi integration tests skip cleanly in a host-independent install without those peers.
+The current v2.1 suite contains 123 tests when Pi peer dependencies are available. Pi integration tests skip cleanly in a host-independent install without those peers.
 
 For the complete design, compatibility matrix, security boundaries, and lifecycle specification, see [`MODEL_ARCHITECTURE.md`](./MODEL_ARCHITECTURE.md).

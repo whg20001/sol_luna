@@ -5,3 +5,15 @@ coverage/
 .e2e-*/
 .e2e-*
 .DS_Store
+# Generated Sol-Luna project runtime/install state. .pi/settings.json is intentionally
+# not ignored because teams may share pinned project package declarations.
+.pi/agents/luna-worker.md
+.pi/agents/validator-worker.md
+.pi/agents/sol-worker.md
+.pi/subagents.json
+.pi/sol-luna-router.json
+.pi/sol-luna-models.json
+.pi/sol-luna-runtime.json
+.pi/sol-luna-ui.json
+.pi/.sol-luna-ui.json.lock
+.pi/npm/

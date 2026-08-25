@@ -60,8 +60,11 @@ import {
 
 const AGENT_INSTALL_COMMAND = "pi install -l npm:@tintinweb/pi-subagents@0.16.1";
 const MODEL_ROUTES_FILE = "sol-luna-models.json";
+const RUNTIME_FILE = "sol-luna-runtime.json";
+const RUNTIME_VERSION = 1;
 const TOKEN_UI_FILE = "sol-luna-ui.json";
 const TOKEN_UI_WIDGET = "sol-luna-token-ui";
+const MANAGED_WORKER_AGENT_TYPES = new Set(["luna-worker", "validator-worker", "sol-worker"]);
 const AGENT_TEMPLATE_URLS = Object.freeze({
   "agents/luna-worker.md": new URL("../../templates/agents/luna-worker.md", import.meta.url),
   "agents/validator-worker.md": new URL("../../templates/agents/validator-worker.md", import.meta.url),
@@ -75,6 +78,7 @@ function projectPaths(cwd) {
     subagents: join(configDir, "subagents.json"),
     marker: join(configDir, "sol-luna-router.json"),
     modelRoutes: join(configDir, MODEL_ROUTES_FILE),
+    runtime: join(configDir, RUNTIME_FILE),
     tokenUi: join(configDir, TOKEN_UI_FILE),
     tokenUiLock: join(configDir, `.${TOKEN_UI_FILE}.lock`),
     luna: join(configDir, "agents", "luna-worker.md"),
@@ -90,6 +94,22 @@ function lstatOrUndefined(path) {
     if (error?.code === "ENOENT") return undefined;
     throw error;
   }
+}
+
+export function projectWatchRefreshTargets(filename) {
+  if (filename == null) return { runtime: true, tokenUi: true };
+  const changed = String(filename);
+  if (!changed) return { runtime: true, tokenUi: true };
+  return {
+    runtime: changed === RUNTIME_FILE,
+    tokenUi: changed === TOKEN_UI_FILE,
+  };
+}
+
+function managedWorkerAgentType(event) {
+  if (event?.toolName !== "Agent" || typeof event.input?.subagent_type !== "string") return "";
+  const agentType = event.input.subagent_type.trim().toLowerCase();
+  return MANAGED_WORKER_AGENT_TYPES.has(agentType) ? agentType : "";
 }
 
 function assertRegularPath(path, { allowMissing = true } = {}) {
@@ -165,19 +185,75 @@ function projectIdentity(cwd) {
   }
 }
 
+function initialProjectRuntimeState() {
+  return { version: RUNTIME_VERSION, paused: false };
+}
+
+function normalizeProjectRuntimeState(value) {
+  if (!isPlainObject(value)) throw new Error("Sol-Luna runtime state must be a JSON object.");
+  const unknown = Object.keys(value).filter((key) => !["version", "paused"].includes(key));
+  if (unknown.length > 0) throw new Error(`Sol-Luna runtime state contains unknown field(s): ${unknown.join(", ")}.`);
+  if (value.version !== RUNTIME_VERSION) throw new Error(`Sol-Luna runtime state.version must be ${RUNTIME_VERSION}.`);
+  if (typeof value.paused !== "boolean") throw new Error("Sol-Luna runtime state.paused must be a boolean.");
+  return { version: RUNTIME_VERSION, paused: value.paused };
+}
+
+function readProjectRuntimeState(paths, { repairInvalid = false } = {}) {
+  const missing = () => ({
+    state: initialProjectRuntimeState(),
+    repaired: false,
+    status: "missing",
+    missing: true,
+    valid: false,
+  });
+  const configStat = lstatOrUndefined(paths.configDir);
+  if (!configStat) return missing();
+  if (configStat.isSymbolicLink() || !configStat.isDirectory()) {
+    throw new Error(`Refusing unsafe project configuration directory: ${paths.configDir}`);
+  }
+  const text = readText(paths.runtime);
+  if (text === undefined) return missing();
+  try {
+    return {
+      state: normalizeProjectRuntimeState(JSON.parse(text)),
+      repaired: false,
+      status: "valid",
+      missing: false,
+      valid: true,
+    };
+  } catch (error) {
+    if (!repairInvalid) {
+      if (error instanceof SyntaxError) throw new Error(`Invalid JSON in ${paths.runtime}: ${error.message}`);
+      throw new Error(`${paths.runtime} is invalid: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    return {
+      state: initialProjectRuntimeState(),
+      repaired: true,
+      status: "invalid",
+      missing: false,
+      valid: false,
+    };
+  }
+}
+
+function writeProjectRuntimeState(paths, paused) {
+  assertDirectory(paths.configDir);
+  writeAtomic(paths.runtime, jsonText({ version: RUNTIME_VERSION, paused: paused === true }));
+}
+
 function readProjectTokenState(paths, { repairInvalid = false } = {}) {
   const configStat = lstatOrUndefined(paths.configDir);
-  if (!configStat) return { state: initialProjectTokenState(), repaired: false };
+  if (!configStat) return { state: initialProjectTokenState(), repaired: false, status: "missing" };
   if (configStat.isSymbolicLink() || !configStat.isDirectory()) {
     throw new Error(`Refusing unsafe project configuration directory: ${paths.configDir}`);
   }
   const text = readText(paths.tokenUi);
-  if (text === undefined) return { state: initialProjectTokenState(), repaired: false };
+  if (text === undefined) return { state: initialProjectTokenState(), repaired: false, status: "missing" };
   let parsed;
   try {
     parsed = JSON.parse(text);
     if (!isPlainObject(parsed)) throw new Error(`${paths.tokenUi} must contain a JSON object.`);
-    return { state: normalizeProjectTokenState(parsed), repaired: false };
+    return { state: normalizeProjectTokenState(parsed), repaired: false, status: "valid" };
   } catch (error) {
     if (!repairInvalid) {
       if (error instanceof SyntaxError) throw new Error(`Invalid JSON in ${paths.tokenUi}: ${error.message}`);
@@ -186,6 +262,7 @@ function readProjectTokenState(paths, { repairInvalid = false } = {}) {
     return {
       state: initialProjectTokenState({ visible: isPlainObject(parsed) && parsed.visible === true }),
       repaired: true,
+      status: "invalid",
     };
   }
 }
@@ -764,9 +841,17 @@ function statusReport(pi, ctx, state) {
     routeLines = [`Model routes: invalid (${error instanceof Error ? error.message : String(error)})`];
   }
 
+  let runtimeLine;
+  try {
+    const runtime = readProjectRuntimeState(paths).state;
+    runtimeLine = `Runtime: ${runtime.paused ? "paused" : "active"} (${CONFIG_DIR_NAME}/${RUNTIME_FILE})`;
+  } catch (error) {
+    runtimeLine = `Runtime: invalid (${error instanceof Error ? error.message : String(error)})`;
+  }
   const report = [
     `pi-sol-luna-router ${PACKAGE_VERSION}`,
     `Project trusted: ${ctx.isProjectTrusted()}`,
+    runtimeLine,
     `Agent dependency: ${hasAgentTool(pi) ? "present" : `missing — install with: ${AGENT_INSTALL_COMMAND}`}`,
     ...routeLines,
     `Marker: ${markerLine}`,
@@ -1061,7 +1146,7 @@ ${CACHE_FRIENDLY_PROTOCOL_PREFIX}
 - Only the user may run /sol-luna-reset. The router state, Context Envelope, Task Memory, and Failure Snapshot are authoritative.
 `;
 
-export function createPiAdapter(pi) {
+export function createPiAdapter(pi, options = {}) {
   const managedDispatches = new Map();
   const workerDispatchByAgentId = new Map();
   const pendingPlannerUsage = new Map();
@@ -1074,7 +1159,35 @@ export function createPiAdapter(pi) {
   let tokenWidgetTui = null;
   let tokenWidgetInstalled = false;
   let tokenUiWatcher = null;
+  let watcherGeneration = 0;
+  let tokenUiRefreshTimer = null;
   let tokenUiWarning = null;
+  let runtimeRefreshTimer = null;
+  const readRetries = {
+    tokenUi: { timer: null, count: 0, projectId: null },
+    runtime: { timer: null, count: 0, projectId: null },
+  };
+  const watchProject = options.watch ?? watch;
+  const setTimer = options.setTimeout ?? setTimeout;
+  const clearTimer = options.clearTimeout ?? clearTimeout;
+  const READ_RETRY_LIMIT = 5;
+  const READ_RETRY_DELAY = 100;
+  const WATCH_REFRESH_DELAY = 75;
+
+  const clearTransientCorrelations = () => {
+    managedDispatches.clear();
+    workerDispatchByAgentId.clear();
+    pendingPlannerUsage.clear();
+    eligiblePlannerMessages.clear();
+  };
+
+  const runtimeStateFor = (ctx) => readProjectRuntimeState(projectPaths(projectIdentity(ctx.cwd))).state;
+
+  const assertRuntimeEnabled = (ctx) => {
+    if (ctx?.cwd && runtimeStateFor(ctx).paused) {
+      throw new Error("Sol-Luna is paused for this project. Run /sol-luna-enable to resume orchestration.");
+    }
+  };
 
   const persistState = (previousSnapshot) => {
     try {
@@ -1087,20 +1200,45 @@ export function createPiAdapter(pi) {
 
   const requestTokenWidgetRender = () => tokenWidgetTui?.requestRender?.();
 
+  const resetReadRetry = (kind) => {
+    const retry = readRetries[kind];
+    if (retry.timer !== null) clearTimer(retry.timer);
+    retry.timer = null;
+    retry.count = 0;
+    retry.projectId = null;
+  };
+
+  const cancelTokenUiTimers = () => {
+    if (tokenUiRefreshTimer !== null) clearTimer(tokenUiRefreshTimer);
+    tokenUiRefreshTimer = null;
+    resetReadRetry("tokenUi");
+  };
+
+  const cancelRuntimeTimers = () => {
+    if (runtimeRefreshTimer !== null) clearTimer(runtimeRefreshTimer);
+    runtimeRefreshTimer = null;
+    resetReadRetry("runtime");
+  };
+
   const closeTokenUiWatcher = () => {
+    watcherGeneration += 1;
+    cancelTokenUiTimers();
+    cancelRuntimeTimers();
     tokenUiWatcher?.close?.();
     tokenUiWatcher = null;
   };
 
-  const applyTokenWidget = (ctx) => {
+  const applyTokenWidget = (ctx, { force = false } = {}) => {
     if (!ctx?.ui?.setWidget) return;
-    if (ctx.mode !== "tui" || tokenUiState.visible !== true) {
+    const eligible = ctx.mode === "tui" && tokenUiState.visible === true
+      && activeSession?.paused !== true && activeSession?.runtimeInvalid !== true;
+    if (!eligible) {
       if (tokenWidgetInstalled) ctx.ui.setWidget(TOKEN_UI_WIDGET, undefined);
       tokenWidgetTui = null;
       tokenWidgetInstalled = false;
       return;
     }
-    if (tokenWidgetInstalled) {
+    if (tokenWidgetInstalled && !force) {
       requestTokenWidgetRender();
       return;
     }
@@ -1128,47 +1266,153 @@ export function createPiAdapter(pi) {
     }
   };
 
+  const currentWatcherProject = (projectId, generation) => (
+    generation === watcherGeneration && activeSession?.projectId === projectId && activeSession?.ctx
+  );
+
+  const resetTokenUiRetry = () => resetReadRetry("tokenUi");
+  const resetRuntimeRetry = () => resetReadRetry("runtime");
+
+  const scheduleReadRetry = (kind, projectId, generation, refresh) => {
+    const retry = readRetries[kind];
+    if (retry.projectId !== projectId) retry.count = 0;
+    retry.projectId = projectId;
+    retry.count += 1;
+    if (retry.timer !== null) clearTimer(retry.timer);
+    retry.timer = setTimer(() => {
+      retry.timer = null;
+      if (currentWatcherProject(projectId, generation)) refresh(activeSession.ctx);
+    }, READ_RETRY_DELAY);
+  };
+
+  const refreshRuntimeState = (ctx, {
+    watcherOrigin = false,
+    generation = watcherGeneration,
+    applyWidget = true,
+  } = {}) => {
+    if (!ctx || typeof ctx.cwd !== "string") return false;
+    const projectId = projectIdentity(ctx.cwd);
+    if (watcherOrigin && !currentWatcherProject(projectId, generation)) return false;
+    try {
+      const result = readProjectRuntimeState(projectPaths(projectId));
+      const preserveInactive = watcherOrigin && result.missing === true
+        && activeSession?.projectId === projectId
+        && (activeSession.paused === true || activeSession.runtimeInvalid === true);
+      if (preserveInactive && readRetries.runtime.count < READ_RETRY_LIMIT) {
+        scheduleReadRetry("runtime", projectId, generation, (retryCtx) => refreshRuntimeState(retryCtx, { watcherOrigin: true, generation }));
+        if (applyWidget) applyTokenWidget(ctx);
+        return activeSession.runtimeInvalid === true ? null : true;
+      }
+      resetRuntimeRetry();
+      const paused = result.state.paused;
+      const changed = activeSession?.projectId === projectId && activeSession.paused !== paused;
+      if (activeSession?.projectId === projectId) activeSession = { ...activeSession, ctx, paused, runtimeInvalid: false };
+      if (paused && changed) clearTransientCorrelations();
+      if (activeSession?.projectId === projectId && applyWidget) applyTokenWidget(ctx);
+      return paused;
+    } catch (error) {
+      resetRuntimeRetry();
+      // An unreadable runtime must fail closed for Sol-Luna state. Do not turn
+      // an integrity failure into an active widget/accounting session.
+      if (activeSession?.projectId === projectId) activeSession = { ...activeSession, ctx, paused: true, runtimeInvalid: true };
+      clearTransientCorrelations();
+      warnTokenUiOnce(ctx, error);
+      if (applyWidget) applyTokenWidget(ctx);
+      return null;
+    }
+  };
+
+  const refreshTokenUiState = (ctx, {
+    watcherOrigin = false,
+    generation = watcherGeneration,
+    applyWidget = true,
+  } = {}) => {
+    if (!ctx || typeof ctx.cwd !== "string") return false;
+    const projectId = projectIdentity(ctx.cwd);
+    if (watcherOrigin && !currentWatcherProject(projectId, generation)) return false;
+    try {
+      const result = readProjectTokenState(projectPaths(projectId));
+      if (watcherOrigin && result.status === "missing" && readRetries.tokenUi.count < READ_RETRY_LIMIT) {
+        scheduleReadRetry("tokenUi", projectId, generation, (retryCtx) => refreshTokenUiState(retryCtx, { watcherOrigin: true, generation }));
+        if (applyWidget) applyTokenWidget(ctx);
+        return false;
+      }
+      resetTokenUiRetry();
+      tokenUiState = result.state;
+      tokenUiWarning = null;
+      if (activeSession?.projectId === projectId) activeSession.ctx = ctx;
+      if (applyWidget) {
+        applyTokenWidget(ctx);
+        requestTokenWidgetRender();
+      }
+      return true;
+    } catch (error) {
+      if (watcherOrigin && readRetries.tokenUi.count < READ_RETRY_LIMIT) {
+        scheduleReadRetry("tokenUi", projectId, generation, (retryCtx) => refreshTokenUiState(retryCtx, { watcherOrigin: true, generation }));
+        if (applyWidget) applyTokenWidget(ctx);
+        return false;
+      }
+      resetTokenUiRetry();
+      // A stable deletion or persistent corruption is not an atomic-write gap:
+      // fail closed and remove the stale display instead of preserving forever.
+      tokenUiState = initialProjectTokenState();
+      if (applyWidget) applyTokenWidget(ctx);
+      warnTokenUiOnce(ctx, error);
+      return false;
+    }
+  };
+
   const startTokenUiWatcher = (ctx) => {
     closeTokenUiWatcher();
     if (ctx?.mode !== "tui" || typeof ctx.cwd !== "string") return;
     try {
-      const paths = projectPaths(projectIdentity(ctx.cwd));
+      const projectId = projectIdentity(ctx.cwd);
+      const paths = projectPaths(projectId);
       const stat = lstatOrUndefined(paths.configDir);
       if (!stat) return;
       if (stat.isSymbolicLink() || !stat.isDirectory()) {
         throw new Error(`Refusing unsafe project configuration directory: ${paths.configDir}`);
       }
-      tokenUiWatcher = watch(paths.configDir, { persistent: false }, (_eventType, filename) => {
-        if (String(filename ?? "") !== TOKEN_UI_FILE || !activeSession?.ctx) return;
-        refreshTokenUiState(activeSession.ctx);
+      const generation = watcherGeneration;
+      tokenUiWatcher = watchProject(paths.configDir, { persistent: false }, (_eventType, filename) => {
+        if (!currentWatcherProject(projectId, generation)) return;
+        const targets = projectWatchRefreshTargets(filename);
+        if (targets.tokenUi) {
+          if (tokenUiRefreshTimer !== null) clearTimer(tokenUiRefreshTimer);
+          tokenUiRefreshTimer = setTimer(() => {
+            tokenUiRefreshTimer = null;
+            if (currentWatcherProject(projectId, generation)) {
+              refreshTokenUiState(activeSession.ctx, { watcherOrigin: true, generation });
+            }
+          }, WATCH_REFRESH_DELAY);
+        }
+        if (targets.runtime) {
+          if (runtimeRefreshTimer !== null) clearTimer(runtimeRefreshTimer);
+          runtimeRefreshTimer = setTimer(() => {
+            runtimeRefreshTimer = null;
+            if (currentWatcherProject(projectId, generation)) {
+              refreshRuntimeState(activeSession.ctx, { watcherOrigin: true, generation });
+            }
+          }, WATCH_REFRESH_DELAY);
+        }
       });
-      tokenUiWatcher.on("error", (error) => warnTokenUiOnce(ctx, error));
+      tokenUiWatcher.on("error", (error) => {
+        if (currentWatcherProject(projectId, generation)) warnTokenUiOnce(ctx, error);
+      });
     } catch (error) {
       warnTokenUiOnce(ctx, error);
-    }
-  };
-
-  const refreshTokenUiState = (ctx) => {
-    if (!ctx || typeof ctx.cwd !== "string") return false;
-    const projectId = projectIdentity(ctx.cwd);
-    try {
-      tokenUiState = readProjectTokenState(projectPaths(projectId)).state;
-      tokenUiWarning = null;
-      if (activeSession?.projectId === projectId) activeSession.ctx = ctx;
-      applyTokenWidget(ctx);
-      requestTokenWidgetRender();
-      return true;
-    } catch (error) {
-      tokenUiState = initialProjectTokenState();
-      applyTokenWidget(ctx);
-      warnTokenUiOnce(ctx, error);
-      return false;
     }
   };
 
   const mutateActiveProjectTokens = (ctx, mutator) => {
     if (!ctx || typeof ctx.cwd !== "string" || !ctx.isProjectTrusted?.()) return false;
     const projectId = projectIdentity(ctx.cwd);
+    try {
+      if (readProjectRuntimeState(projectPaths(projectId)).state.paused) return false;
+    } catch (error) {
+      warnTokenUiOnce(ctx, error);
+      return false;
+    }
     if (activeSession?.projectId && activeSession.projectId !== projectId) return false;
     try {
       const update = mutateProjectTokenState(projectId, mutator);
@@ -1250,6 +1494,13 @@ export function createPiAdapter(pi) {
   }
 
   pi.on("session_start", (_event, ctx) => {
+    if (activeSession?.ctx?.ui?.setWidget && tokenWidgetInstalled) {
+      activeSession.ctx.ui.setWidget(TOKEN_UI_WIDGET, undefined);
+    }
+    closeTokenUiWatcher();
+    tokenUiState = initialProjectTokenState();
+    tokenWidgetTui = null;
+    tokenWidgetInstalled = false;
     managedDispatches.clear();
     workerDispatchByAgentId.clear();
     pendingPlannerUsage.clear();
@@ -1260,9 +1511,30 @@ export function createPiAdapter(pi) {
       tokenUiState = initialProjectTokenState();
       return;
     }
-    activeSession = { ctx, projectId: projectIdentity(ctx.cwd) };
-    refreshTokenUiState(ctx);
+    const projectId = projectIdentity(ctx.cwd);
+    let paused = false;
+    let runtimeInvalid = false;
+    try {
+      paused = readProjectRuntimeState(projectPaths(projectId)).state.paused;
+    } catch (error) {
+      warnTokenUiOnce(ctx, error);
+      // Preserve ordinary Pi access, but fail closed for Sol-Luna.
+      paused = true;
+      runtimeInvalid = true;
+    }
+    activeSession = { ctx, projectId, paused, runtimeInvalid };
+    refreshTokenUiState(ctx, { applyWidget: false });
     startTokenUiWatcher(ctx);
+    applyTokenWidget(ctx, { force: true });
+  });
+
+  // Pi can rebuild UI registrations after an agent turn. Reinstall only for
+  // this explicit lifecycle self-heal; ordinary refreshes reuse ownership.
+  pi.on("agent_settled", (_event, ctx) => {
+    if (!activeSession?.ctx || !ctx || activeSession.projectId !== projectIdentity(ctx.cwd)) return;
+    refreshRuntimeState(ctx, { applyWidget: false });
+    refreshTokenUiState(ctx, { applyWidget: false });
+    applyTokenWidget(ctx, { force: true });
   });
 
   pi.on("session_shutdown", (_event, ctx) => {
@@ -1271,17 +1543,15 @@ export function createPiAdapter(pi) {
     tokenWidgetInstalled = false;
     closeTokenUiWatcher();
     activeSession = null;
-    managedDispatches.clear();
-    workerDispatchByAgentId.clear();
-    pendingPlannerUsage.clear();
-    eligiblePlannerMessages.clear();
+    tokenUiState = initialProjectTokenState();
+    clearTransientCorrelations();
   });
 
   pi.on("message_end", (event, ctx) => {
     const message = event?.message;
     if (message?.role !== "assistant" || typeof ctx?.cwd !== "string") return;
     const projectId = projectIdentity(ctx.cwd);
-    if (activeSession?.projectId !== projectId || managedRuntimeState(ctx.cwd) !== "ready") return;
+    if (activeSession?.projectId !== projectId || refreshRuntimeState(ctx) !== false || managedRuntimeState(ctx.cwd) !== "ready") return;
     const candidate = {
       projectId,
       key: `planner:${assistantMessageKey(ctx, message)}`,
@@ -1293,6 +1563,7 @@ export function createPiAdapter(pi) {
   pi.on("turn_end", (event, ctx) => {
     const message = event?.message;
     if (message?.role !== "assistant" || typeof ctx?.cwd !== "string") return;
+    if (refreshRuntimeState(ctx) !== false) return;
     const key = `planner:${assistantMessageKey(ctx, message)}`;
     if (!eligiblePlannerMessages.delete(key)) return;
     const tokens = tokenTotalFromUsage(message.usage);
@@ -1301,8 +1572,23 @@ export function createPiAdapter(pi) {
   });
 
   pi.on("before_agent_start", (_event, ctx) => {
+    let runtimeError = null;
+    try {
+      if (runtimeStateFor(ctx).paused) return;
+    } catch (error) {
+      // Preserve the normal managed-file integrity boundary below while keeping
+      // a malformed runtime from enabling orchestration.
+      runtimeError = error;
+    }
     const runtimeState = managedRuntimeState(ctx.cwd);
-    if (runtimeState === "inactive") return;
+    if (runtimeState === "inactive" || runtimeError) {
+      if (runtimeState === "unsafe") {
+        return {
+          systemPrompt: `${_event.systemPrompt}\n\n## Sol-Luna Integrity Failure\nManaged files do not match the project marker. Do not run implementation workers or mutate files. Ask the user to run /sol-luna-update or /sol-luna-models reset --force.`,
+        };
+      }
+      return;
+    }
     if (runtimeState === "unsafe") {
       return {
         systemPrompt: `${_event.systemPrompt}\n\n## Sol-Luna Integrity Failure\nManaged files do not match the project marker. Do not run implementation workers or mutate files. Ask the user to run /sol-luna-update or /sol-luna-models reset --force.`,
@@ -1318,6 +1604,25 @@ export function createPiAdapter(pi) {
   });
 
   pi.on("tool_call", (event, ctx) => {
+    let projectRuntime;
+    try {
+      projectRuntime = runtimeStateFor(ctx);
+    } catch (error) {
+      const reason = `Sol-Luna runtime state is invalid or unsafe: ${error instanceof Error ? error.message : String(error)}`;
+      if (typeof event.toolName === "string" && event.toolName.startsWith("sol_luna_")) {
+        return { block: true, reason };
+      }
+      if (managedWorkerAgentType(event)) return { block: true, reason };
+      // Fail closed only for Sol-Luna orchestration. Ordinary unrelated Pi
+      // tools and Agent calls remain available, matching explicit pause behavior.
+      return;
+    }
+    if (projectRuntime?.paused === true) {
+      if ((typeof event.toolName === "string" && event.toolName.startsWith("sol_luna_")) || managedWorkerAgentType(event)) {
+        return { block: true, reason: "Sol-Luna is paused for this project. Run /sol-luna-enable to resume orchestration." };
+      }
+      return;
+    }
     const runtimeState = managedRuntimeState(ctx.cwd);
     if (runtimeState === "inactive") return;
     if (runtimeState === "unsafe") {
@@ -1448,6 +1753,7 @@ export function createPiAdapter(pi) {
       path: Type.Optional(Type.String({ description: "Project-relative .js/.mjs/.cjs or JSON file for syntax-only checks." })),
     }),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      assertRuntimeEnabled(ctx);
       let command;
       let baseArgs;
       if (params.check === "git-diff-check") [command, baseArgs] = ["git", ["diff", "--check"]];
@@ -1499,6 +1805,7 @@ export function createPiAdapter(pi) {
       reason: Type.Optional(Type.String({ description: "Evidence for a validation or recovery failure." })),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      assertRuntimeEnabled(ctx);
       const pendingPlannerCandidate = params.action === "start_task" ? pendingPlannerUsage.get(_toolCallId) : null;
       if (_toolCallId) pendingPlannerUsage.delete(_toolCallId);
       if (!["start_task", "plan_ready", "status"].includes(params.action)) {
@@ -1588,6 +1895,7 @@ export function createPiAdapter(pi) {
       max_input_tokens: Type.Optional(Type.Integer({ minimum: 256 })),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      assertRuntimeEnabled(ctx);
       let routing;
       const effectiveComplexity = params.complexity ?? router.getReasoningProfile()?.complexity ?? "medium";
       if (ctx) {
@@ -1636,7 +1944,8 @@ export function createPiAdapter(pi) {
       request_id: Type.Optional(Type.String({ description: "Request ID returned by sol_luna_prepare_worker." })),
       implementation_role: Type.Optional(StringEnum(["luna", "sol"], { description: "For Validator reports, which implementation is being validated." })),
     }),
-    async execute(_toolCallId, params) {
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      assertRuntimeEnabled(ctx ?? activeSession?.ctx);
       let report;
       try {
         report = JSON.parse(params.report_json);
@@ -1701,7 +2010,8 @@ export function createPiAdapter(pi) {
       quality: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
       cost: Type.Optional(Type.Number({ minimum: 0 })),
     }),
-    async execute(_toolCallId, params) {
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      assertRuntimeEnabled(ctx ?? activeSession?.ctx);
       const previousSnapshot = router.snapshot();
       try {
         router.recordUsageFeedback({
@@ -1760,8 +2070,51 @@ export function createPiAdapter(pi) {
     },
   });
 
+  pi.registerCommand("sol-luna-disable", {
+    description: "Pause Sol-Luna orchestration for the current project",
+    handler: async (_args, ctx) => {
+      if (!requireTrusted(ctx)) return;
+      try {
+        const paths = projectPaths(ctx.cwd);
+        const current = readProjectRuntimeState(paths).state;
+        if (current.paused) {
+          notify(ctx, "Sol-Luna is already paused for this project.", "info");
+          return;
+        }
+        writeProjectRuntimeState(paths, true);
+        clearTransientCorrelations();
+        if (activeSession?.projectId === projectIdentity(ctx.cwd)) activeSession = { ...activeSession, ctx, paused: true, runtimeInvalid: false };
+        startTokenUiWatcher(ctx);
+        applyTokenWidget(ctx);
+        notify(ctx, "Sol-Luna paused for the current project. Managed files, routes, router state, token totals, and token UI preference were preserved.", "success");
+      } catch (error) {
+        notify(ctx, `Sol-Luna pause failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+      }
+    },
+  });
+
+  pi.registerCommand("sol-luna-enable", {
+    description: "Resume Sol-Luna orchestration for the current project",
+    handler: async (_args, ctx) => {
+      if (!requireTrusted(ctx)) return;
+      try {
+        const paths = projectPaths(ctx.cwd);
+        const current = readProjectRuntimeState(paths, { repairInvalid: true });
+        writeProjectRuntimeState(paths, false);
+        const projectId = projectIdentity(ctx.cwd);
+        if (activeSession?.projectId === projectId) activeSession = { ...activeSession, ctx, paused: false, runtimeInvalid: false };
+        refreshTokenUiState(ctx);
+        startTokenUiWatcher(ctx);
+        applyTokenWidget(ctx);
+        notify(ctx, `Sol-Luna enabled for the current project${current.repaired ? " (repaired the malformed runtime state file)" : ""}. Router state, managed files, routes, token totals, and token UI preference were preserved.`, "success");
+      } catch (error) {
+        notify(ctx, `Sol-Luna resume failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+      }
+    },
+  });
+
   pi.registerCommand("sol-luna-status", {
-    description: "Show Sol-Luna dependency, files, version, and circuit status",
+    description: "Show Sol-Luna dependency, files, version, pause, and circuit status",
     handler: async (_args, ctx) => {
       try {
         statusReport(pi, ctx, router.getState());
@@ -1879,8 +2232,17 @@ export function createPiAdapter(pi) {
             : setProjectTokenVisibility(state, action === "on")
         ), { repairInvalid: action === "reset" });
         if (!activeSession || activeSession.projectId === projectId) {
+          let paused = false;
+          let runtimeInvalid = false;
+          try {
+            paused = readProjectRuntimeState(paths).state.paused;
+          } catch (runtimeError) {
+            paused = true;
+            runtimeInvalid = true;
+            warnTokenUiOnce(ctx, runtimeError);
+          }
           tokenUiState = update.state;
-          activeSession = { ctx, projectId };
+          activeSession = { ctx, projectId, paused, runtimeInvalid };
           startTokenUiWatcher(ctx);
           applyTokenWidget(ctx);
           requestTokenWidgetRender();

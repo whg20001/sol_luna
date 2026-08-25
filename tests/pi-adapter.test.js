@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -124,6 +124,7 @@ function commandContext(root, notifications = [], overrides = {}) {
       select: overrides.select ?? (async () => undefined),
       confirm: overrides.confirm ?? (async () => false),
       setWidget(name, factory, options) {
+        if (overrides.setWidget) return overrides.setWidget(name, factory, options);
         if (factory === undefined) widgets.delete(name);
         else widgets.set(name, { factory, options });
       },
@@ -133,10 +134,97 @@ function commandContext(root, notifications = [], overrides = {}) {
   };
 }
 
+function createFakeScheduler() {
+  let nextId = 1;
+  const pending = new Map();
+  return {
+    setTimeout(callback, delay) {
+      const id = nextId;
+      nextId += 1;
+      pending.set(id, { callback, delay });
+      return id;
+    },
+    clearTimeout(id) { pending.delete(id); },
+    pendingCount() { return pending.size; },
+    pendingDelays() { return [...pending.values()].map(({ delay }) => delay); },
+    pendingCallbacks() { return [...pending.values()].map(({ callback }) => callback); },
+    runNext() {
+      const entry = pending.entries().next().value;
+      if (!entry) return false;
+      const [id, task] = entry;
+      pending.delete(id);
+      task.callback();
+      return true;
+    },
+    runAll(limit = 100) {
+      let count = 0;
+      while (pending.size > 0) {
+        assert.ok(count < limit, "fake timer queue did not settle");
+        this.runNext();
+        count += 1;
+      }
+      return count;
+    },
+  };
+}
+
+function createFakeWatch() {
+  const records = [];
+  const watch = (path, options, callback) => {
+    const record = {
+      path,
+      options,
+      callback,
+      closed: false,
+      handlers: new Map(),
+    };
+    records.push(record);
+    return {
+      close() { record.closed = true; },
+      on(name, handler) { record.handlers.set(name, handler); return this; },
+    };
+  };
+  return { watch, records };
+}
+
+function createWidgetRegistry() {
+  const widgets = new Map();
+  const calls = [];
+  let renderRequests = 0;
+  return {
+    widgets,
+    calls,
+    get renderRequests() { return renderRequests; },
+    setWidget(name, factory, options) {
+      calls.push({ name, factory, options });
+      if (factory === undefined) {
+        widgets.delete(name);
+        return;
+      }
+      const component = factory({ requestRender() { renderRequests += 1; } });
+      widgets.set(name, { factory, options, component });
+    },
+    installs(name = "sol-luna-token-ui") {
+      return calls.filter((call) => call.name === name && call.factory !== undefined).length;
+    },
+    clears(name = "sol-luna-token-ui") {
+      return calls.filter((call) => call.name === name && call.factory === undefined).length;
+    },
+  };
+}
+
+function tokenUiFile(root) {
+  return join(root, configDirName, "sol-luna-ui.json");
+}
+
+function runtimeFile(root) {
+  return join(root, configDirName, "sol-luna-runtime.json");
+}
+
 test("Pi adapter registers v2 tools and materializes Luna, Validator, and Sol", { skip: skipWithoutPiPeers }, async () => {
   const fake = createFakePi();
   piModule.createPiAdapter(fake.pi);
-  assert.deepEqual([...fake.events.keys()].sort(), ["before_agent_start", "message_end", "session_shutdown", "session_start", "tool_call", "tool_result", "turn_end"]);
+  assert.deepEqual([...fake.events.keys()].sort(), ["agent_settled", "before_agent_start", "message_end", "session_shutdown", "session_start", "tool_call", "tool_result", "turn_end"]);
   assert.deepEqual([...fake.tools.keys()].sort(), [
     "sol_luna_gate",
     "sol_luna_prepare_worker",
@@ -145,6 +233,8 @@ test("Pi adapter registers v2 tools and materializes Luna, Validator, and Sol", 
     "sol_luna_validate",
   ]);
   assert.deepEqual([...fake.commands.keys()].sort(), [
+    "sol-luna-disable",
+    "sol-luna-enable",
     "sol-luna-init",
     "sol-luna-models",
     "sol-luna-remove",
@@ -181,6 +271,444 @@ test("Pi adapter registers v2 tools and materializes Luna, Validator, and Sol", 
     assert.equal(notifications.at(-1).level, "success");
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("project-local pause persists, isolates projects, preserves state, and gates only Sol-Luna tools", { skip: skipWithoutPiPeers }, async () => {
+  const fake = createFakePi();
+  piModule.createPiAdapter(fake.pi);
+  const firstRoot = mkdtempSync(join(tmpdir(), "sol-luna-pause-a-"));
+  const secondRoot = mkdtempSync(join(tmpdir(), "sol-luna-pause-b-"));
+  try {
+    await fake.commands.get("sol-luna-init").handler("", commandContext(firstRoot));
+    await fake.commands.get("sol-luna-init").handler("", commandContext(secondRoot));
+    const widgets = new Map();
+    const ctx = commandContext(firstRoot, [], { mode: "tui", hasUI: true, widgets });
+    fake.events.get("session_start")({}, ctx);
+    await fake.commands.get("sol-luna-token-ui").handler("on", ctx);
+    const beforeEntries = fake.entries.length;
+    const markerBefore = readFileSync(join(firstRoot, configDirName, "sol-luna-router.json"), "utf8");
+    const prompt = fake.events.get("before_agent_start")({ systemPrompt: "BASE" }, ctx).systemPrompt;
+    assert.match(prompt, /Host Orchestration Protocol/);
+
+    await fake.commands.get("sol-luna-disable").handler("", ctx);
+    assert.deepEqual(JSON.parse(readFileSync(join(firstRoot, configDirName, "sol-luna-runtime.json"), "utf8")), { version: 1, paused: true });
+    assert.equal(readFileSync(join(firstRoot, configDirName, "sol-luna-router.json"), "utf8"), markerBefore);
+    assert.equal(fake.entries.length, beforeEntries);
+    assert.equal(widgets.has("sol-luna-token-ui"), false);
+    assert.equal(fake.events.get("before_agent_start")({ systemPrompt: "BASE" }, ctx), undefined);
+    assert.equal(fake.events.get("tool_call")({ toolName: "bash", input: {} }, ctx), undefined);
+    assert.equal(fake.events.get("tool_call")({ toolName: "Agent", input: { subagent_type: "unrelated-worker" } }, ctx), undefined);
+    const pausedManaged = fake.events.get("tool_call")({ toolName: "Agent", input: { subagent_type: "luna-worker" } }, ctx);
+    assert.equal(pausedManaged.block, true);
+    assert.match(pausedManaged.reason, /paused/i);
+    const blocked = fake.events.get("tool_call")({ toolName: "sol_luna_gate", input: {} }, ctx);
+    assert.equal(blocked.block, true);
+    assert.match(blocked.reason, /paused/i);
+
+    const pausedMessage = { role: "assistant", responseId: "paused", timestamp: 1, usage: { input: 100, output: 20 } };
+    fake.events.get("message_end")({ message: pausedMessage }, ctx);
+    fake.events.get("turn_end")({ message: pausedMessage }, ctx);
+    assert.deepEqual(JSON.parse(readFileSync(join(firstRoot, configDirName, "sol-luna-ui.json"), "utf8")).tokens, {
+      planner: 0, luna: 0, validator: 0, sol: 0,
+    });
+
+    await fake.commands.get("sol-luna-enable").handler("", ctx);
+    assert.deepEqual(JSON.parse(readFileSync(join(firstRoot, configDirName, "sol-luna-runtime.json"), "utf8")), { version: 1, paused: false });
+    assert.equal(widgets.has("sol-luna-token-ui"), true);
+    assert.match(fake.events.get("before_agent_start")({ systemPrompt: "BASE" }, ctx).systemPrompt, /Host Orchestration Protocol/);
+    await fake.commands.get("sol-luna-disable").handler("", ctx);
+    const secondNotifications = [];
+    const secondCtx = commandContext(secondRoot, secondNotifications, { mode: "tui", hasUI: true, widgets: new Map() });
+    fake.events.get("session_start")({}, secondCtx);
+    assert.match(fake.events.get("before_agent_start")({ systemPrompt: "BASE" }, secondCtx).systemPrompt, /Host Orchestration Protocol/);
+    assert.equal(fake.events.get("tool_call")({ toolName: "sol_luna_gate", input: {} }, secondCtx), undefined);
+    await fake.commands.get("sol-luna-status").handler("", commandContext(firstRoot, secondNotifications));
+    assert.match(secondNotifications.at(-1).message, /Runtime: paused/);
+    await fake.commands.get("sol-luna-status").handler("", secondCtx);
+    assert.match(secondNotifications.at(-1).message, /Runtime: active/);
+  } finally {
+    rmSync(firstRoot, { recursive: true, force: true });
+    rmSync(secondRoot, { recursive: true, force: true });
+  }
+});
+
+test("token UI commands preserve paused state and never re-show the widget", { skip: skipWithoutPiPeers }, async () => {
+  const fake = createFakePi();
+  piModule.createPiAdapter(fake.pi);
+  const root = mkdtempSync(join(tmpdir(), "sol-luna-pause-token-ui-"));
+  try {
+    await fake.commands.get("sol-luna-init").handler("", commandContext(root));
+    const widgets = new Map();
+    const ctx = commandContext(root, [], { mode: "tui", hasUI: true, widgets });
+    fake.events.get("session_start")({}, ctx);
+    await fake.commands.get("sol-luna-token-ui").handler("on", ctx);
+    assert.equal(widgets.has("sol-luna-token-ui"), true);
+    await fake.commands.get("sol-luna-disable").handler("", ctx);
+    assert.equal(widgets.has("sol-luna-token-ui"), false);
+    await fake.commands.get("sol-luna-token-ui").handler("on", ctx);
+    assert.equal(widgets.has("sol-luna-token-ui"), false);
+    await fake.commands.get("sol-luna-token-ui").handler("reset", ctx);
+    assert.equal(widgets.has("sol-luna-token-ui"), false);
+    assert.deepEqual(JSON.parse(readFileSync(join(root, configDirName, "sol-luna-runtime.json"), "utf8")), { version: 1, paused: true });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("invalid runtime fails closed for Sol-Luna tools and managed Agents only", { skip: skipWithoutPiPeers }, async () => {
+  const fake = createFakePi();
+  piModule.createPiAdapter(fake.pi);
+  const root = mkdtempSync(join(tmpdir(), "sol-luna-runtime-invalid-"));
+  try {
+    await fake.commands.get("sol-luna-init").handler("", commandContext(root));
+    const widgets = new Map();
+    const ctx = commandContext(root, [], { mode: "tui", hasUI: true, widgets });
+    fake.events.get("session_start")({}, ctx);
+    await fake.commands.get("sol-luna-token-ui").handler("on", ctx);
+    await fake.tools.get("sol_luna_gate").execute("invalid-runtime-start", {
+      action: "start_task",
+      task_id: "invalid-runtime",
+      task_label: "invalid runtime gating",
+    }, undefined, undefined, ctx);
+    await fake.tools.get("sol_luna_prepare_worker").execute("invalid-runtime-prepare", {
+      role: "luna",
+      instruction: "This prepared dispatch must not run after runtime corruption.",
+    }, undefined, undefined, ctx);
+    writeFileSync(join(root, configDirName, "sol-luna-runtime.json"), "{broken\\n");
+    fake.events.get("message_end")({ message: { role: "assistant", responseId: "invalid-runtime" } }, ctx);
+    assert.equal(widgets.has("sol-luna-token-ui"), false);
+
+    for (const toolName of ["read", "edit", "write", "bash"]) {
+      assert.equal(fake.events.get("tool_call")({ toolName, input: {} }, ctx), undefined);
+    }
+    assert.equal(fake.events.get("tool_call")({ toolName: "Agent", input: { subagent_type: "unrelated-worker" } }, ctx), undefined);
+
+    for (const subagent_type of ["luna-worker", "validator-worker", "sol-worker"]) {
+      const blocked = fake.events.get("tool_call")({ toolName: "Agent", input: { subagent_type } }, ctx);
+      assert.equal(blocked.block, true);
+      assert.match(blocked.reason, /invalid|unsafe/i);
+    }
+    for (const toolName of fake.tools.keys()) {
+      const blocked = fake.events.get("tool_call")({ toolName, input: {} }, ctx);
+      assert.equal(blocked.block, true);
+      assert.match(blocked.reason, /invalid|unsafe/i);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("project watcher refresh targets handle unnamed, runtime, and token events", { skip: skipWithoutPiPeers }, () => {
+  assert.deepEqual(piModule.projectWatchRefreshTargets(null), { runtime: true, tokenUi: true });
+  assert.deepEqual(piModule.projectWatchRefreshTargets(undefined), { runtime: true, tokenUi: true });
+  assert.deepEqual(piModule.projectWatchRefreshTargets(""), { runtime: true, tokenUi: true });
+  assert.deepEqual(piModule.projectWatchRefreshTargets("sol-luna-runtime.json"), { runtime: true, tokenUi: false });
+  assert.deepEqual(piModule.projectWatchRefreshTargets("sol-luna-ui.json"), { runtime: false, tokenUi: true });
+  assert.deepEqual(piModule.projectWatchRefreshTargets("settings.json"), { runtime: false, tokenUi: false });
+});
+
+test("project watcher schedules only requested refresh targets", { skip: skipWithoutPiPeers }, async () => {
+  const fake = createFakePi();
+  const scheduler = createFakeScheduler();
+  const watched = createFakeWatch();
+  piModule.createPiAdapter(fake.pi, {
+    watch: watched.watch,
+    setTimeout: scheduler.setTimeout,
+    clearTimeout: scheduler.clearTimeout,
+  });
+  const root = mkdtempSync(join(tmpdir(), "sol-luna-watch-targets-"));
+  try {
+    await fake.commands.get("sol-luna-init").handler("", commandContext(root));
+    const ctx = commandContext(root, [], { mode: "tui", hasUI: true });
+    fake.events.get("session_start")({}, ctx);
+    const watcher = watched.records.at(-1);
+
+    watcher.callback("rename", "sol-luna-runtime.json");
+    assert.equal(scheduler.pendingCount(), 1);
+    assert.deepEqual(scheduler.pendingDelays(), [75]);
+    scheduler.runAll();
+
+    watcher.callback("change", "sol-luna-ui.json");
+    assert.equal(scheduler.pendingCount(), 1);
+    assert.deepEqual(scheduler.pendingDelays(), [75]);
+    scheduler.runAll();
+
+    watcher.callback("rename", undefined);
+    assert.equal(scheduler.pendingCount(), 2);
+    assert.deepEqual(scheduler.pendingDelays().sort((a, b) => a - b), [75, 75]);
+    scheduler.runAll();
+
+    watcher.callback("change", "settings.json");
+    assert.equal(scheduler.pendingCount(), 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("token watcher grace preserves replacements then hides stable deletion and malformed state", { skip: skipWithoutPiPeers }, async () => {
+  const fake = createFakePi();
+  const scheduler = createFakeScheduler();
+  const watched = createFakeWatch();
+  const registry = createWidgetRegistry();
+  const notifications = [];
+  piModule.createPiAdapter(fake.pi, {
+    watch: watched.watch,
+    setTimeout: scheduler.setTimeout,
+    clearTimeout: scheduler.clearTimeout,
+  });
+  const root = mkdtempSync(join(tmpdir(), "sol-luna-token-watch-grace-"));
+  try {
+    await fake.commands.get("sol-luna-init").handler("", commandContext(root));
+    const ctx = commandContext(root, notifications, {
+      mode: "tui",
+      hasUI: true,
+      setWidget: registry.setWidget.bind(registry),
+    });
+    fake.events.get("session_start")({}, ctx);
+    await fake.commands.get("sol-luna-token-ui").handler("on", ctx);
+    assert.equal(registry.widgets.has("sol-luna-token-ui"), true);
+    const initialInstalls = registry.installs();
+
+    let watcher = watched.records.at(-1);
+    const replacement = readFileSync(tokenUiFile(root), "utf8");
+    unlinkSync(tokenUiFile(root));
+    watcher.callback("rename", "sol-luna-ui.json");
+    scheduler.runNext();
+    assert.equal(registry.widgets.has("sol-luna-token-ui"), true);
+    assert.equal(scheduler.pendingCount(), 1);
+    writeFileSync(tokenUiFile(root), replacement);
+    scheduler.runAll();
+    assert.equal(registry.widgets.has("sol-luna-token-ui"), true);
+    assert.equal(registry.installs(), initialInstalls);
+
+    unlinkSync(tokenUiFile(root));
+    watcher.callback("rename", "sol-luna-ui.json");
+    scheduler.runAll();
+    assert.equal(registry.widgets.has("sol-luna-token-ui"), false);
+
+    await fake.commands.get("sol-luna-token-ui").handler("on", ctx);
+    watcher = watched.records.at(-1);
+    writeFileSync(tokenUiFile(root), "{malformed\n");
+    watcher.callback("change", "sol-luna-ui.json");
+    scheduler.runAll();
+    assert.equal(registry.widgets.has("sol-luna-token-ui"), false);
+    assert.equal(notifications.some(({ level, message }) => level === "warning" && /invalid json/i.test(message)), true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("runtime watcher never re-shows paused state during replacement and activates after stable deletion", { skip: skipWithoutPiPeers }, async () => {
+  const fake = createFakePi();
+  const scheduler = createFakeScheduler();
+  const watched = createFakeWatch();
+  const registry = createWidgetRegistry();
+  piModule.createPiAdapter(fake.pi, {
+    watch: watched.watch,
+    setTimeout: scheduler.setTimeout,
+    clearTimeout: scheduler.clearTimeout,
+  });
+  const root = mkdtempSync(join(tmpdir(), "sol-luna-runtime-watch-grace-"));
+  try {
+    await fake.commands.get("sol-luna-init").handler("", commandContext(root));
+    const ctx = commandContext(root, [], {
+      mode: "tui",
+      hasUI: true,
+      setWidget: registry.setWidget.bind(registry),
+    });
+    fake.events.get("session_start")({}, ctx);
+    await fake.commands.get("sol-luna-token-ui").handler("on", ctx);
+    await fake.commands.get("sol-luna-disable").handler("", ctx);
+    assert.equal(registry.widgets.has("sol-luna-token-ui"), false);
+
+    let watcher = watched.records.at(-1);
+    unlinkSync(runtimeFile(root));
+    watcher.callback("rename", "sol-luna-runtime.json");
+    scheduler.runNext();
+    assert.equal(registry.widgets.has("sol-luna-token-ui"), false);
+    writeFileSync(runtimeFile(root), `${JSON.stringify({ version: 1, paused: true })}\n`);
+    while (scheduler.runNext()) assert.equal(registry.widgets.has("sol-luna-token-ui"), false);
+
+    unlinkSync(runtimeFile(root));
+    watcher.callback("rename", "sol-luna-runtime.json");
+    let becameVisible = false;
+    while (scheduler.runNext()) {
+      if (registry.widgets.has("sol-luna-token-ui")) becameVisible = true;
+      if (scheduler.pendingCount() > 0) assert.equal(registry.widgets.has("sol-luna-token-ui"), false);
+    }
+    assert.equal(becameVisible, true);
+    assert.equal(registry.widgets.has("sol-luna-token-ui"), true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("widget ownership reuses normal registration and agent_settled repairs a stale registry once", { skip: skipWithoutPiPeers }, async () => {
+  const fake = createFakePi();
+  const scheduler = createFakeScheduler();
+  const watched = createFakeWatch();
+  const registry = createWidgetRegistry();
+  piModule.createPiAdapter(fake.pi, {
+    watch: watched.watch,
+    setTimeout: scheduler.setTimeout,
+    clearTimeout: scheduler.clearTimeout,
+  });
+  const root = mkdtempSync(join(tmpdir(), "sol-luna-widget-ownership-"));
+  try {
+    await fake.commands.get("sol-luna-init").handler("", commandContext(root));
+    const ctx = commandContext(root, [], {
+      mode: "tui",
+      hasUI: true,
+      setWidget: registry.setWidget.bind(registry),
+    });
+    fake.events.get("session_start")({}, ctx);
+    await fake.commands.get("sol-luna-token-ui").handler("on", ctx);
+    const installed = registry.installs();
+    const state = JSON.parse(readFileSync(tokenUiFile(root), "utf8"));
+    state.tokens.planner = 25;
+    writeFileSync(tokenUiFile(root), `${JSON.stringify(state)}\n`);
+    watched.records.at(-1).callback("change", "sol-luna-ui.json");
+    scheduler.runAll();
+    assert.equal(registry.installs(), installed);
+    assert.ok(registry.renderRequests > 0);
+
+    registry.widgets.clear();
+    fake.events.get("agent_settled")({}, ctx);
+    assert.equal(registry.installs(), installed + 1);
+    assert.equal(registry.widgets.size, 1);
+    assert.equal(registry.widgets.has("sol-luna-token-ui"), true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("session switch and shutdown close watchers, cancel timers, and reject stale callbacks", { skip: skipWithoutPiPeers }, async () => {
+  const fake = createFakePi();
+  const scheduler = createFakeScheduler();
+  const watched = createFakeWatch();
+  const registry = createWidgetRegistry();
+  piModule.createPiAdapter(fake.pi, {
+    watch: watched.watch,
+    setTimeout: scheduler.setTimeout,
+    clearTimeout: scheduler.clearTimeout,
+  });
+  const firstRoot = mkdtempSync(join(tmpdir(), "sol-luna-watch-switch-a-"));
+  const secondRoot = mkdtempSync(join(tmpdir(), "sol-luna-watch-switch-b-"));
+  try {
+    await fake.commands.get("sol-luna-init").handler("", commandContext(firstRoot));
+    await fake.commands.get("sol-luna-init").handler("", commandContext(secondRoot));
+    const visibleState = {
+      version: 1,
+      visible: true,
+      tokens: { planner: 0, luna: 0, validator: 0, sol: 0 },
+      seen: { plannerMessages: [], workerRuns: [] },
+    };
+    writeFileSync(tokenUiFile(firstRoot), `${JSON.stringify(visibleState)}\n`);
+    writeFileSync(tokenUiFile(secondRoot), `${JSON.stringify(visibleState)}\n`);
+    const firstCtx = commandContext(firstRoot, [], {
+      mode: "tui",
+      hasUI: true,
+      setWidget: registry.setWidget.bind(registry),
+    });
+    const secondCtx = commandContext(secondRoot, [], {
+      mode: "tui",
+      hasUI: true,
+      setWidget: registry.setWidget.bind(registry),
+    });
+    fake.events.get("session_start")({}, firstCtx);
+    const firstWatcher = watched.records.at(-1);
+    unlinkSync(tokenUiFile(firstRoot));
+    firstWatcher.callback("rename", "sol-luna-ui.json");
+    scheduler.runNext();
+    const staleRetry = scheduler.pendingCallbacks()[0];
+    assert.equal(typeof staleRetry, "function");
+
+    fake.events.get("session_start")({}, secondCtx);
+    const secondWatcher = watched.records.at(-1);
+    assert.equal(firstWatcher.closed, true);
+    assert.equal(scheduler.pendingCount(), 0);
+    const installsAfterSwitch = registry.installs();
+    const secondBefore = readFileSync(tokenUiFile(secondRoot), "utf8");
+    firstWatcher.callback("rename", undefined);
+    staleRetry();
+    assert.equal(scheduler.pendingCount(), 0);
+    assert.equal(registry.installs(), installsAfterSwitch);
+    assert.equal(readFileSync(tokenUiFile(secondRoot), "utf8"), secondBefore);
+
+    secondWatcher.callback("rename", "sol-luna-ui.json");
+    assert.equal(scheduler.pendingCount(), 1);
+    const staleShutdown = scheduler.pendingCallbacks()[0];
+    fake.events.get("session_shutdown")({}, secondCtx);
+    assert.equal(secondWatcher.closed, true);
+    assert.equal(scheduler.pendingCount(), 0);
+    staleShutdown();
+    secondWatcher.callback("rename", undefined);
+    assert.equal(scheduler.pendingCount(), 0);
+    assert.equal(registry.widgets.has("sol-luna-token-ui"), false);
+  } finally {
+    rmSync(firstRoot, { recursive: true, force: true });
+    rmSync(secondRoot, { recursive: true, force: true });
+  }
+});
+
+test("pause enable repairs malformed regular runtime state and rejects unsafe paths", { skip: skipWithoutPiPeers }, async () => {
+  const fake = createFakePi();
+  piModule.createPiAdapter(fake.pi);
+  const root = mkdtempSync(join(tmpdir(), "sol-luna-pause-security-"));
+  const target = mkdtempSync(join(tmpdir(), "sol-luna-pause-target-"));
+  try {
+    const configDir = join(root, configDirName);
+    mkdirSync(configDir, { recursive: true });
+    writeFileSync(join(configDir, "sol-luna-runtime.json"), "{broken\\n");
+    const notifications = [];
+    const ctx = commandContext(root, notifications);
+    await fake.commands.get("sol-luna-disable").handler("", ctx);
+    assert.equal(notifications.at(-1).level, "error");
+    await fake.commands.get("sol-luna-enable").handler("", ctx);
+    assert.equal(notifications.at(-1).level, "success");
+    assert.deepEqual(JSON.parse(readFileSync(join(configDir, "sol-luna-runtime.json"), "utf8")), { version: 1, paused: false });
+    rmSync(configDir, { recursive: true, force: true });
+    symlinkSync(target, configDir);
+    await fake.commands.get("sol-luna-enable").handler("", ctx);
+    assert.equal(notifications.at(-1).level, "error");
+    assert.match(notifications.at(-1).message, /unsafe project configuration directory/i);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(target, { recursive: true, force: true });
+  }
+});
+
+test("pause state persists across adapter reloads and rejects future-version and symlink runtime files", { skip: skipWithoutPiPeers }, async () => {
+  const first = createFakePi();
+  piModule.createPiAdapter(first.pi);
+  const root = mkdtempSync(join(tmpdir(), "sol-luna-runtime-reload-"));
+  const target = mkdtempSync(join(tmpdir(), "sol-luna-runtime-target-"));
+  try {
+    await first.commands.get("sol-luna-init").handler("", commandContext(root));
+    const firstCtx = commandContext(root);
+    await first.commands.get("sol-luna-disable").handler("", firstCtx);
+
+    const second = createFakePi();
+    piModule.createPiAdapter(second.pi);
+    const secondCtx = commandContext(root);
+    second.events.get("session_start")({}, secondCtx);
+    assert.equal(second.events.get("before_agent_start")({ systemPrompt: "BASE" }, secondCtx), undefined);
+    assert.equal(second.events.get("tool_call")({ toolName: "sol_luna_gate", input: {} }, secondCtx).block, true);
+
+    writeFileSync(join(root, configDirName, "sol-luna-runtime.json"), JSON.stringify({ version: 99, paused: false }));
+    const futureNotifications = [];
+    await second.commands.get("sol-luna-status").handler("", commandContext(root, futureNotifications));
+    assert.match(futureNotifications.at(-1).message, /Runtime: invalid/);
+    assert.equal(second.events.get("tool_call")({ toolName: "sol_luna_gate", input: {} }, secondCtx).block, true);
+
+    rmSync(join(root, configDirName, "sol-luna-runtime.json"));
+    symlinkSync(join(target, "runtime.json"), join(root, configDirName, "sol-luna-runtime.json"));
+    const symlinkBlocked = second.events.get("tool_call")({ toolName: "sol_luna_gate", input: {} }, secondCtx);
+    assert.equal(symlinkBlocked.block, true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(target, { recursive: true, force: true });
   }
 });
 
@@ -694,6 +1222,27 @@ test("interactive Pi model configuration writes selected explicit routes", { ski
     assert.equal(routes.luna.candidates[0].model, "one");
     assert.equal(routes.validator.candidates[0].model, "two");
     assert.equal(routes.sol.candidates[0].model, "three");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("init, update, remove, and reset preserve the project pause file", { skip: skipWithoutPiPeers }, async () => {
+  const fake = createFakePi();
+  piModule.createPiAdapter(fake.pi);
+  const root = mkdtempSync(join(tmpdir(), "sol-luna-pause-lifecycle-"));
+  try {
+    const ctx = commandContext(root);
+    await fake.commands.get("sol-luna-init").handler("", ctx);
+    await fake.commands.get("sol-luna-disable").handler("", ctx);
+    const runtimePath = join(root, configDirName, "sol-luna-runtime.json");
+    const paused = readFileSync(runtimePath, "utf8");
+    await fake.commands.get("sol-luna-update").handler("", ctx);
+    assert.equal(readFileSync(runtimePath, "utf8"), paused);
+    await fake.commands.get("sol-luna-reset").handler("", ctx);
+    assert.equal(readFileSync(runtimePath, "utf8"), paused);
+    await fake.commands.get("sol-luna-remove").handler("", ctx);
+    assert.equal(readFileSync(runtimePath, "utf8"), paused);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

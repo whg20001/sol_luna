@@ -42,6 +42,7 @@ v2.1 在 v2.0 的 Context Envelope、Task Memory、Failure Snapshot 和状态机
 | Snapshot 外层格式 | `1` | `{ version: 1, state: ... }` |
 | Model Route 配置 | `1` 或 `2` | v1 自动补全 Planner 和 Validator |
 | Managed Marker | `v2` | 可安全升级 v1 两 Agent Marker |
+| Project Runtime Pause | `1` | `.pi/sol-luna-runtime.json`; 缺失表示 active |
 
 ## 3. 总体组件图
 
@@ -1074,6 +1075,8 @@ sol_luna_record_usage
 ### 18.3 命令
 
 ```text
+/sol-luna-disable
+/sol-luna-enable
 /sol-luna-init
 /sol-luna-update
 /sol-luna-models
@@ -1086,6 +1089,8 @@ sol_luna_record_usage
 /sol-luna-remove
 /sol-luna-reset
 ```
+
+`/sol-luna-disable` 和 `/sol-luna-enable` 只作用于当前规范化项目路径。暂停状态严格保存为 `.pi/sol-luna-runtime.json` 的 `{version: 1, paused: boolean}`；缺失表示 active，`disable` 和 `enable` 分别写入显式 paused/active 文件。暂停时保留 Marker、Agent 模板、模型路由、Router Session snapshot 和 Token 累计，只清理 adapter 的临时 dispatch/planner correlation，省略系统提示注入、隐藏 Token widget、跳过项目 Token 统计，并拒绝 `sol_luna_*` 工具及 `luna-worker`、`validator-worker`、`sol-worker` 托管 Agent dispatch；普通无关 Pi edit/write/bash/Agent 与其他扩展继续运行。`enable` 可显式修复普通文件中的 malformed JSON，但目录和文件符号链接均拒绝。init/update/remove/reset 不会静默删除 pause 文件；status 显示 active、paused 或 invalid。invalid/unsafe runtime 状态对全部 Sol-Luna 编排 fail closed：阻止所有 `sol_luna_*` 工具以及 `luna-worker`、`validator-worker`、`sol-worker` 托管 Agent dispatch，但普通无关 Pi 工具和 Agent 调用继续可用。Session start 和事件边界刷新 pause 状态；TUI 配置目录 watcher 对 runtime 文件事件刷新 pause 状态、对 token 文件事件刷新 token 状态，并在 filename 为 `null` 或 `undefined` 的原子替换事件中同时刷新两者。
 
 `/sol-luna-models` 在 Pi TUI/RPC 中提供交互向导，可显式选择 Planner 模式以及 Luna、Validator、Sol 模型；Planner、Luna 和 Fast Validator thinking 可配置，Sol 按恢复策略固定为 `high`。无需编辑 JSON。非交互环境可使用：
 
@@ -1119,6 +1124,8 @@ Fast 失败时再次准备 Deep Validator；Deep 失败后由状态机决定 Lun
 
 - Root `edit`、`write`、`bash` 被阻止。
 - 非托管 Agent 被阻止。
+- 项目 paused 时不注入 Sol-Luna system prompt；阻止 `sol_luna_*` 工具和三类托管 worker Agent，普通无关 Pi edit/write/bash/Agent 不受阻止。
+- runtime JSON invalid/unsafe 时不注入 Sol-Luna system prompt，阻止全部 `sol_luna_*` 工具和三类托管 worker Agent，但允许普通无关 Pi 工具与 Agent。
 - 未准备的托管 Agent 被阻止。
 - `schedule`、`resume`、model override、thinking override 被阻止。
 - Agent prompt 被替换为 Router 生成的 `renderedPrompt`。
@@ -1144,6 +1151,7 @@ P(…%),L(…%),V(…%),S(…%)
 - 切换项目后读取该项目独立的 `.pi/sol-luna-ui.json`。
 - 新任务和 `/sol-luna-reset` 不清零项目累计值。
 - `/sol-luna-token-ui reset` 只清零当前项目，并保留可见性与事件去重历史；显式 reset 也可修复格式损坏的普通 JSON 文件，但仍拒绝符号链接或不安全目录。
+- paused 项目停止 Planner/worker Token accounting 并暂时隐藏 widget；resume 后沿用原有累计值和 visibility preference。
 - `/sol-luna-remove` 不删除用户拥有的 Token 统计文件。
 
 角色归属：
