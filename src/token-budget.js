@@ -31,6 +31,26 @@ function outputTokens(value, fallback) {
   return Number.isInteger(candidate) && candidate > 0 ? candidate : fallback;
 }
 
+// Route profiles override output allocation only, never frozen reasoning.
+export function normalizeRouteBudgetProfile(value, path = "budgetProfile") {
+  if (value === undefined) return undefined;
+  if (typeof value === "string") {
+    try {
+      roleName(value);
+    } catch {
+      throw new Error(`${path} must name planner, luna/executor, validator, or sol/recovery.`);
+    }
+    return value.trim().toLowerCase();
+  }
+  const keys = isObject(value) ? Object.keys(value) : [];
+  const aliases = ["outputTokens", "outputBudget", "maxOutputTokens", "maxTokens"];
+  if (keys.length !== 1 || !aliases.includes(keys[0])
+    || !Number.isSafeInteger(value[keys[0]]) || value[keys[0]] <= 0) {
+    throw new Error(`${path} must contain exactly one positive safe integer outputTokens (or outputBudget/maxOutputTokens/maxTokens).`);
+  }
+  return { ...value };
+}
+
 export function normalizeBudgetPolicy(value = {}) {
   if (value != null && !isObject(value)) throw new TypeError("Budget policy must be an object.");
   const source = value ?? {};
@@ -128,12 +148,16 @@ export function resolveTokenBudget(roleOrOptions, complexityOrPolicy = "medium",
     throw new Error(`Unsupported task complexity: ${String(complexity)}.`);
   }
   const policy = normalizeBudgetPolicy(policyInput);
+  const profile = normalizeRouteBudgetProfile(objectForm ? roleOrOptions.budgetProfile : undefined);
   const configured = policy.roles[role];
+  const allocation = typeof profile === "string"
+    ? policy.roles[roleName(profile)].outputTokens
+    : outputTokens(profile, configured.outputTokens);
   const baseBudget = {
     role,
     complexity,
     thinking: configured.thinking,
-    outputTokens: Math.max(1, Math.round(configured.outputTokens * policy.complexityMultipliers[complexity])),
+    outputTokens: Math.max(1, Math.round(allocation * policy.complexityMultipliers[complexity])),
   };
   const feedback = objectForm ? roleOrOptions.feedback : undefined;
   return feedback
@@ -185,7 +209,23 @@ export function compactEnvelopeToBudget(envelope, budgetOrOptions, maybeOptions 
   const budget = tokenLimit(budgetOrOptions);
   const estimator = typeof options.estimator === "function" ? options.estimator : null;
   const compacted = clone(normalizeContextEnvelope(envelope, options));
-  const fits = () => estimateTokens(compacted, estimator) <= budget;
+  // Hosts may measure a fully rendered prompt: tokenizers need not be additive.
+  // Repeated fit checks of an unchanged candidate reuse the expensive measurement.
+  let lastSerialized;
+  let measured;
+  const fits = () => {
+    const serialized = canonicalStringify(compacted);
+    if (serialized !== lastSerialized) {
+      measured = typeof options.measureTokens === "function"
+        ? options.measureTokens(compacted)
+        : estimateTokens(serialized, estimator ? (text) => estimator(text, compacted) : undefined);
+      if (!Number.isFinite(measured) || measured < 0) {
+        throw new Error("Token measurement must return a finite non-negative number.");
+      }
+      lastSerialized = serialized;
+    }
+    return Math.ceil(measured) <= budget;
+  };
   if (fits()) return compacted;
 
   // Old runtime events are cheapest to reconstruct and are removed first.

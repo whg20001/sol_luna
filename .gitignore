@@ -5,6 +5,8 @@ coverage/
 .e2e-*/
 .e2e-*
 .DS_Store
+# Windows download provenance; not project source.
+*:Zone.Identifier
 # Generated Sol-Luna project runtime/install state. .pi/settings.json is intentionally
 # not ignored because teams may share pinned project package declarations.
 .pi/agents/luna-worker.md

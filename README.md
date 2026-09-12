@@ -140,7 +140,7 @@ Memory projection is role-specific:
 | Deep Validator | Acceptance + Artifact + State + Failure evidence |
 | Sol | Goal/State + Artifact + Failure Snapshot + Decision Summary |
 
-All roles still receive minimal runtime IDs. Event streams, logs, reports, and arrays are bounded before serialization.
+All roles still receive minimal runtime IDs. Event streams, logs, reports, and arrays are bounded before serialization. Worker prompts use compact JSON for both envelope and schema by default; `renderWorkerPrompt({ ..., serialization: { pretty: true } })` enables readable debug output without changing data or string whitespace. The `contextEnvelope`/`envelope` request aliases remain for compatibility; only one envelope appears in the rendered prompt.
 
 ## Failure Snapshot
 
@@ -174,6 +174,8 @@ A failed validation creates and persists a snapshot containing:
   "memory_revision": 7
 }
 ```
+
+When `createFailureSnapshot()` is called without an explicit ID, it hashes recursively canonicalized evidence with SHA-256. Nested errors, validation and decision summaries participate in the hash. Explicit and persisted IDs remain unchanged; the router's default UUID factory is unchanged.
 
 Sol preparation is blocked when a v2 task has no current Failure Snapshot. Sol receives the latest snapshot and is instructed to inspect affected files rather than re-read the entire project. `decision_summary` stores an auditable decision trace, never private chain-of-thought.
 
@@ -245,6 +247,15 @@ Default output budgets:
 | Sol | high | 6000 |
 
 `low`, `medium`, and `high` task complexity apply configurable multipliers. The selected complexity is frozen in the Reasoning Profile. Recent role usage feedback can adjust output budgets within a bounded ±25% loop: repeated successful non-truncated calls reduce budget, while failures and truncation increase it. `compactEnvelopeToBudget()` removes old events, truncates logs, and drops old reports/tests before touching task state. Objective, acceptance criteria, and the current error are retained.
+
+Optional worker route `budgetProfile` now affects `request.budget.outputTokens` and `maxOutputTokens`:
+
+- A role name (`planner`/`root`, `luna`/`executor`, `validator`, `sol`/`recovery`) uses that role's configured base output allocation.
+- An inline object, e.g. `{ "outputTokens": 1200 }`, overrides the base allocation. Exactly one of `outputTokens`, `outputBudget`, `maxOutputTokens`, or `maxTokens` is accepted.
+- Task complexity and usage feedback apply afterwards; frozen thinking is never overridden.
+- Unknown names, fields, conflicting aliases and non-positive values now fail explicitly instead of being silently ignored. Previously ignored arbitrary profiles must be migrated to this format.
+
+Input compaction uses one pass measured against the complete rendered prompt, caching unchanged candidate measurements. Custom estimators need not be additive. These input estimates exclude host-added system prompts/tools; output budgets remain metadata that the integrating harness must map to its provider limit. The current Pi Agent API does not expose an output-token cap, so Pi output budgets are not hard provider limits.
 
 ## Pi installation
 
@@ -528,6 +539,7 @@ Codex and DeepSeek wrappers are in `examples/`.
 ## Security and persistence
 
 - Generic adapters cannot enforce filesystem permissions for unknown hosts. Use sandboxes, read-only mounts, or capability allowlists for the parent and Validator.
+- Pi syntax/JSON validation rejects symbolic links at every component below the canonical project root and checks the resolved target remains inside it. This is path validation, not protection against a hostile process concurrently replacing directories; use a sandbox for that threat model.
 - Logs and histories are bounded, but integrating hosts should still avoid placing secrets in worker reports.
 - Adapter operations are serialized per instance. Multiple instances sharing storage should add compare-and-swap checks using the persisted revision.
 - Sol start is persisted before execution. A failed persistence prevents launch; a started Sol attempt is never silently restored.
@@ -561,6 +573,6 @@ npm run check
 npm pack --dry-run
 ```
 
-The current v2.1 suite contains 123 tests when Pi peer dependencies are available. Pi integration tests skip cleanly in a host-independent install without those peers.
+For development, run `npm ci --ignore-scripts` to install the locked Pi test peers, then `npm run check`. The suite includes Pi integration and review regression tests. `npm run test:pi` requires Pi peers and fails rather than skipping when they are missing. CI also requires Pi peers on Node 22 and 24. A host-independent installation without peers may still run `npm test` with Pi tests skipped; unexpected adapter import failures are never treated as missing peers.
 
 For the complete design, compatibility matrix, security boundaries, and lifecycle specification, see [`MODEL_ARCHITECTURE.md`](./MODEL_ARCHITECTURE.md).

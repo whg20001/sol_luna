@@ -122,6 +122,8 @@ const SCHEMAS = Object.freeze({
   }),
 });
 
+const SCHEMA_TEXT = Object.fromEntries(Object.entries(SCHEMAS).map(([role, schema]) => [role, JSON.stringify(schema)]));
+
 function normalizeRole(value) {
   const role = typeof value === "string" ? value.trim().toLowerCase() : "";
   if (role === "root") return "planner";
@@ -228,9 +230,11 @@ export function renderRuntimeSuffix(options = {}) {
   if (!options.contextEnvelope && !options.envelope) throw new Error("renderRuntimeSuffix requires a Context Envelope.");
   const envelope = serializeContextEnvelope(options.contextEnvelope ?? options.envelope, {
     ...(options.serialization ?? {}),
-    pretty: true,
+    pretty: options.serialization?.pretty === true,
   });
-  const schema = JSON.stringify(workerOutputSchemaForRole(role), null, 2);
+  const schema = options.serialization?.pretty === true
+    ? JSON.stringify(SCHEMAS[role], null, 2)
+    : SCHEMA_TEXT[role];
 
   return `<ROLE>\n${role}\n</ROLE>\n<RUNTIME_PROTOCOL>\nversion=${RUNTIME_PROTOCOL_VERSION}\noutput=strict-json\nschema=${schema}\n</RUNTIME_PROTOCOL>\n<CONTEXT_ENVELOPE>\n${envelope}\n</CONTEXT_ENVELOPE>\n<CURRENT_TASK>\n${task}\n</CURRENT_TASK>`;
 }

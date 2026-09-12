@@ -1,3 +1,6 @@
+import { createHash } from "node:crypto";
+import { canonicalStringify } from "./canonical-json.js";
+
 export const TASK_MEMORY_VERSION = "2.0";
 
 const DEFAULT_LIMITS = Object.freeze({
@@ -353,13 +356,9 @@ export function recordValidationReport(memory, report, options = {}) {
 }
 
 function stableHash(value) {
-  const input = JSON.stringify(value, Object.keys(value).sort());
-  let hash = 2166136261;
-  for (let index = 0; index < input.length; index += 1) {
-    hash ^= input.charCodeAt(index);
-    hash = Math.imul(hash, 16777619);
-  }
-  return (hash >>> 0).toString(36);
+  // A JSON replacer key array filters nested evidence instead of sorting it.
+  // Hash all recursively canonicalized data; existing explicit IDs stay intact.
+  return createHash("sha256").update(canonicalStringify(value)).digest("hex");
 }
 
 export function recordUsageFeedback(memory, feedback, options = {}) {

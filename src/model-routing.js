@@ -1,5 +1,6 @@
 import { isPlainObject } from "./core.js";
 import { rankModelCandidates } from "./model-ranking.js";
+import { normalizeRouteBudgetProfile } from "./token-budget.js";
 
 // Keep these legacy exports stable for version-1 route-file compatibility.
 export const MODEL_ROUTE_VERSION = 1;
@@ -134,13 +135,7 @@ function normalizeThinkingByComplexity(value, path) {
 
 function normalizeBudgetProfile(value, path) {
   if (value === undefined) return undefined;
-  if (typeof value === "string") return nonEmptyString(value, path);
-  if (!isPlainObject(value)) throw new Error(`${path} must be a non-empty string or JSON object.`);
-  try {
-    return JSON.parse(JSON.stringify(value));
-  } catch {
-    throw new Error(`${path} must be JSON serializable.`);
-  }
+  return normalizeRouteBudgetProfile(value, path);
 }
 
 function normalizeWorkerRole(value, role, { legacy = false } = {}) {

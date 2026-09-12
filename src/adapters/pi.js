@@ -13,7 +13,7 @@ import {
   watch,
   writeFileSync,
 } from "node:fs";
-import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
@@ -64,7 +64,11 @@ const RUNTIME_FILE = "sol-luna-runtime.json";
 const RUNTIME_VERSION = 1;
 const TOKEN_UI_FILE = "sol-luna-ui.json";
 const TOKEN_UI_WIDGET = "sol-luna-token-ui";
-const MANAGED_WORKER_AGENT_TYPES = new Set(["luna-worker", "validator-worker", "sol-worker"]);
+const MANAGED_WORKER_ROLES = new Map([
+  ["luna-worker", "luna"],
+  ["validator-worker", "validator"],
+  ["sol-worker", "sol"],
+]);
 const AGENT_TEMPLATE_URLS = Object.freeze({
   "agents/luna-worker.md": new URL("../../templates/agents/luna-worker.md", import.meta.url),
   "agents/validator-worker.md": new URL("../../templates/agents/validator-worker.md", import.meta.url),
@@ -109,7 +113,30 @@ export function projectWatchRefreshTargets(filename) {
 function managedWorkerAgentType(event) {
   if (event?.toolName !== "Agent" || typeof event.input?.subagent_type !== "string") return "";
   const agentType = event.input.subagent_type.trim().toLowerCase();
-  return MANAGED_WORKER_AGENT_TYPES.has(agentType) ? agentType : "";
+  return MANAGED_WORKER_ROLES.has(agentType) ? agentType : "";
+}
+
+function assertProjectPath(cwd, path) {
+  const outside = (value) => !value || value === ".." || value.startsWith(`..${sep}`) || isAbsolute(value);
+  const relativeTarget = relative(resolve(cwd), resolve(cwd, path));
+  if (outside(relativeTarget)) throw new Error("Validation path must remain inside the current project.");
+  // Canonicalize the trusted root, but reject links at every level beneath it.
+  // This also permits a legitimate cwd alias (e.g. macOS /var -> /private/var).
+  const projectRoot = realpathSync(cwd);
+  const parts = relativeTarget.split(sep);
+  let current = projectRoot;
+  for (let index = 0; index < parts.length; index += 1) {
+    current = join(current, parts[index]);
+    const stat = lstatSync(current);
+    if (stat.isSymbolicLink()) throw new Error(`Refusing to follow symbolic link: ${current}`);
+    if (index < parts.length - 1 && !stat.isDirectory()) throw new Error(`Expected a directory: ${current}`);
+  }
+  assertRegularPath(current, { allowMissing: false });
+  const canonicalTarget = realpathSync(current);
+  if (outside(relative(projectRoot, canonicalTarget))) {
+    throw new Error("Validation path must remain inside the current project.");
+  }
+  return canonicalTarget;
 }
 
 function assertRegularPath(path, { allowMissing = true } = {}) {
@@ -1445,11 +1472,7 @@ export function createPiAdapter(pi, options = {}) {
   };
 
   const correlateWorkerStart = (event) => {
-    const role = {
-      "luna-worker": "luna",
-      "validator-worker": "validator",
-      "sol-worker": "sol",
-    }[event?.type];
+    const role = MANAGED_WORKER_ROLES.get(event?.type);
     if (!role || typeof event?.id !== "string" || !event.id) return;
     const match = findManagedDispatch(role);
     if (!match || event.description !== match.dispatch.expectedDescription) return;
@@ -1458,11 +1481,7 @@ export function createPiAdapter(pi, options = {}) {
   };
 
   const recordWorkerCompletion = (event) => {
-    const role = {
-      "luna-worker": "luna",
-      "validator-worker": "validator",
-      "sol-worker": "sol",
-    }[event?.type];
+    const role = MANAGED_WORKER_ROLES.get(event?.type);
     if (!role || typeof event?.id !== "string" || !event.id || !activeSession?.ctx) return;
     const dispatchKey = workerDispatchByAgentId.get(event.id);
     if (dispatchKey === undefined) return;
@@ -1501,10 +1520,7 @@ export function createPiAdapter(pi, options = {}) {
     tokenUiState = initialProjectTokenState();
     tokenWidgetTui = null;
     tokenWidgetInstalled = false;
-    managedDispatches.clear();
-    workerDispatchByAgentId.clear();
-    pendingPlannerUsage.clear();
-    eligiblePlannerMessages.clear();
+    clearTransientCorrelations();
     router.restore(stateFromBranch(ctx));
     if (typeof ctx?.cwd !== "string") {
       activeSession = null;
@@ -1581,19 +1597,13 @@ export function createPiAdapter(pi, options = {}) {
       runtimeError = error;
     }
     const runtimeState = managedRuntimeState(ctx.cwd);
-    if (runtimeState === "inactive" || runtimeError) {
-      if (runtimeState === "unsafe") {
-        return {
-          systemPrompt: `${_event.systemPrompt}\n\n## Sol-Luna Integrity Failure\nManaged files do not match the project marker. Do not run implementation workers or mutate files. Ask the user to run /sol-luna-update or /sol-luna-models reset --force.`,
-        };
-      }
-      return;
-    }
+    if (runtimeState === "inactive") return;
     if (runtimeState === "unsafe") {
       return {
         systemPrompt: `${_event.systemPrompt}\n\n## Sol-Luna Integrity Failure\nManaged files do not match the project marker. Do not run implementation workers or mutate files. Ask the user to run /sol-luna-update or /sol-luna-models reset --force.`,
       };
     }
+    if (runtimeError) return;
     const activeTools = typeof pi.getActiveTools === "function" ? pi.getActiveTools() : [];
     if (activeTools.includes("sol_luna_validate") && !activeTools.includes("Agent")) {
       return {
@@ -1644,66 +1654,53 @@ export function createPiAdapter(pi, options = {}) {
 
     if (event.toolName !== "Agent") return;
     const input = event.input ?? {};
-    const agentType = typeof input.subagent_type === "string" ? input.subagent_type : "";
-    const normalizedAgentType = agentType.trim().toLowerCase();
-    const roleByAgent = {
-      "luna-worker": "luna",
-      "validator-worker": "validator",
-      "sol-worker": "sol",
-    };
-    const managedRole = roleByAgent[normalizedAgentType];
+    const managedRole = MANAGED_WORKER_ROLES.get(managedWorkerAgentType(event));
     if (!managedRole) {
       return { block: true, reason: "Only prepared luna-worker, validator-worker, or sol-worker Agent calls are allowed while the Sol-Luna runtime is active." };
     }
-    if (managedRole && input.schedule) {
+    if (input.schedule) {
       return { block: true, reason: "Scheduled Sol/Luna/Validator calls are blocked because delayed execution can violate the current task state. Start the worker immediately." };
     }
-    if (managedRole && typeof input.model === "string" && input.model.trim()) {
+    if (typeof input.model === "string" && input.model.trim()) {
       return { block: true, reason: `Model overrides are blocked for managed workers. Edit ${CONFIG_DIR_NAME}/${MODEL_ROUTES_FILE} and run /sol-luna-update instead.` };
     }
-    if (managedRole && typeof input.thinking === "string" && input.thinking.trim()) {
+    if (typeof input.thinking === "string" && input.thinking.trim()) {
       return { block: true, reason: "Thinking overrides are blocked for managed workers; use the routed task complexity." };
     }
-    if (managedRole && input.resume) {
+    if (input.resume) {
       return { block: true, reason: "Managed workers must be new isolated calls; resume and hot-switching are blocked." };
     }
     try {
       const pending = router.getPendingRequest();
-      if (managedRole) {
-        if (!pending || pending.role !== managedRole) {
-          return { block: true, reason: `No prepared ${managedRole} request is pending. Call sol_luna_prepare_worker first.` };
-        }
-        if (pending.dispatched === true) {
-          return { block: true, reason: `Prepared ${managedRole} request ${pending.requestId} has already been dispatched.` };
-        }
-        const dispatched = router.markWorkerDispatched({ role: managedRole, requestId: pending.requestId });
-        if (!dispatched.allowed) return { block: true, reason: dispatched.reason };
-        persistState(dispatched.previousSnapshot);
-        input.prompt = pending.renderedPrompt;
-        input.description = `sol-luna ${managedRole} ${pending.requestId}`;
-        input.model = pending.routing?.provider && pending.routing?.model
-          ? `${pending.routing.provider}/${pending.routing.model}`
-          : input.model;
-        input.thinking = pending.budget.thinking;
-        input.inherit_context = false;
-        input.run_in_background = false;
-        const dispatchKey = event.toolCallId ?? pending.requestId;
-        managedDispatches.set(dispatchKey, {
-          role: managedRole,
-          requestId: pending.requestId,
-          validatorMode: pending.validatorMode,
-          taskId: pending.taskId,
-          projectId: projectIdentity(ctx.cwd),
-          usageCounted: false,
-          toolResultSeen: false,
-          agentId: null,
-          expectedDescription: input.description,
-        });
-        return;
+      if (!pending || pending.role !== managedRole) {
+        return { block: true, reason: `No prepared ${managedRole} request is pending. Call sol_luna_prepare_worker first.` };
       }
-      const prepared = router.prepareAgentCall({ agentType, resume: Boolean(input.resume) });
-      if (!prepared.allowed) return { block: true, reason: prepared.reason };
-      if (prepared.changed) persistState(prepared.previousSnapshot);
+      if (pending.dispatched === true) {
+        return { block: true, reason: `Prepared ${managedRole} request ${pending.requestId} has already been dispatched.` };
+      }
+      const dispatched = router.markWorkerDispatched({ role: managedRole, requestId: pending.requestId });
+      if (!dispatched.allowed) return { block: true, reason: dispatched.reason };
+      persistState(dispatched.previousSnapshot);
+      input.prompt = pending.renderedPrompt;
+      input.description = `sol-luna ${managedRole} ${pending.requestId}`;
+      input.model = pending.routing?.provider && pending.routing?.model
+        ? `${pending.routing.provider}/${pending.routing.model}`
+        : input.model;
+      input.thinking = pending.budget.thinking;
+      input.inherit_context = false;
+      input.run_in_background = false;
+      const dispatchKey = event.toolCallId ?? pending.requestId;
+      managedDispatches.set(dispatchKey, {
+        role: managedRole,
+        requestId: pending.requestId,
+        validatorMode: pending.validatorMode,
+        taskId: pending.taskId,
+        projectId: projectIdentity(ctx.cwd),
+        usageCounted: false,
+        toolResultSeen: false,
+        agentId: null,
+        expectedDescription: input.description,
+      });
     } catch (error) {
       return { block: true, reason: error instanceof Error ? error.message : String(error) };
     }
@@ -1760,12 +1757,8 @@ export function createPiAdapter(pi, options = {}) {
       else if (params.check === "git-status") [command, baseArgs] = ["git", ["status", "--short"]];
       else {
         if (!params.path) throw new Error(`${params.check} requires a project-relative path.`);
-        const absolute = resolve(ctx.cwd, params.path);
-        const projectRelative = relative(ctx.cwd, absolute);
-        if (!projectRelative || projectRelative.startsWith("..") || isAbsolute(projectRelative)) {
-          throw new Error("Validation path must remain inside the current project.");
-        }
-        assertRegularPath(absolute, { allowMissing: false });
+        const absolute = assertProjectPath(ctx.cwd, params.path);
+        const projectRelative = relative(realpathSync(ctx.cwd), absolute);
         if (params.check === "node-check") {
           if (!/\.(?:cjs|mjs|js)$/iu.test(absolute)) throw new Error("node-check accepts only .js, .mjs, or .cjs files.");
           [command, baseArgs] = ["node", ["--check", absolute]];

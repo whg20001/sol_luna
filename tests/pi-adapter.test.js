@@ -14,11 +14,39 @@ try {
     import("@earendil-works/pi-coding-agent"),
   ]);
 } catch (error) {
+  const missingOptionalPeer = error?.code === "ERR_MODULE_NOT_FOUND"
+    && /Cannot find package '(?:@earendil-works\/pi-coding-agent|@earendil-works\/pi-ai|typebox)'/.test(error.message);
+  if (!missingOptionalPeer || process.env.SOL_LUNA_REQUIRE_PI_PEERS === "1") throw error;
   loadError = error;
 }
 
 const skipWithoutPiPeers = loadError ? `Pi peer dependencies unavailable: ${loadError.message}` : false;
 const sha256 = (value) => createHash("sha256").update(value, "utf8").digest("hex");
+
+test("safe validation rejects intermediate directory symlinks before reading or executing", { skip: skipWithoutPiPeers }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "sol-luna-validation-"));
+  const outside = mkdtempSync(join(tmpdir(), "sol-luna-outside-"));
+  try {
+    const fake = createFakePi();
+    piModule.default(fake.pi);
+    const ctx = commandContext(root);
+    const validate = fake.tools.get("sol_luna_validate");
+    writeFileSync(join(outside, "secret.json"), "{}");
+    writeFileSync(join(outside, "script.js"), "const a = 1;");
+    symlinkSync(outside, join(root, "escape"), "dir");
+    for (const [check, path] of [["json-check", "escape/secret.json"], ["node-check", "escape/script.js"]]) {
+      await assert.rejects(validate.execute("check", { check, path }, undefined, undefined, ctx), /symbolic link|inside the current project/);
+    }
+    mkdirSync(join(root, "..valid"));
+    writeFileSync(join(root, "..valid", "local.json"), "{}");
+    const valid = await validate.execute("check", { check: "json-check", path: "..valid/local.json" }, undefined, undefined, ctx);
+    assert.equal(valid.details.passed, true);
+    await assert.rejects(validate.execute("check", { check: "json-check", path: "../other.json" }, undefined, undefined, ctx), /inside the current project/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  }
+});
 
 function implementationReport(role = "luna", overrides = {}) {
   return {

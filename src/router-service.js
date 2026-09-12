@@ -529,49 +529,36 @@ export function createRouterService({
         reasoning_profile: reasoningProfile,
       },
     };
+    const routing = explicitRouting ? clone(explicitRouting) : routeFor(normalizedRole, frozenComplexity);
     const budget = resolveTokenBudget({
       role: normalizedRole,
       complexity: frozenComplexity,
       policy: normalizedBudgetPolicy,
+      budgetProfile: routing?.budgetProfile,
       feedback: memory.runtime.usageFeedback,
       taskType: memory.task.taskType ?? frozenComplexity,
     });
-    if (Number.isInteger(maxInputTokens) && maxInputTokens > 0) {
-      const beforeTokens = estimateTokens(envelope, tokenEstimator);
-      envelope = compactEnvelopeToBudget(envelope, { inputTokens: maxInputTokens, estimator: tokenEstimator });
-      contextWasCompressed = estimateTokens(envelope, tokenEstimator) < beforeTokens;
-    }
-    const routing = explicitRouting ? clone(explicitRouting) : routeFor(normalizedRole, frozenComplexity);
     const frozenThinking = normalizedRole === "validator"
       ? reasoningProfile.roles.validator[selectedValidatorMode].thinking
       : reasoningProfile.roles[normalizedRole].thinking;
-    let renderedPrompt = renderWorkerPrompt({
-      role: normalizedRole,
-      contextEnvelope: envelope,
-      currentTask,
+    const render = (candidate) => renderWorkerPrompt({
+      role: normalizedRole, contextEnvelope: candidate, currentTask,
     });
-    if (Number.isInteger(maxInputTokens) && maxInputTokens > 0) {
-      let promptTokens = estimateTokens(renderedPrompt, tokenEstimator);
-      if (promptTokens > maxInputTokens) {
-        const envelopeTokens = estimateTokens(envelope, tokenEstimator);
-        const envelopeBudget = envelopeTokens - (promptTokens - maxInputTokens) - 8;
-        if (envelopeBudget <= 0) {
-          throw new Error(`Worker protocol and Current Task exceed the ${maxInputTokens}-token input budget before Context Envelope data can be included.`);
-        }
-        envelope = compactEnvelopeToBudget(envelope, { inputTokens: envelopeBudget, estimator: tokenEstimator });
-        contextWasCompressed = true;
-        renderedPrompt = renderWorkerPrompt({
-          role: normalizedRole,
-          contextEnvelope: envelope,
-          currentTask,
-        });
-        promptTokens = estimateTokens(renderedPrompt, tokenEstimator);
-      }
-      if (promptTokens > maxInputTokens) {
-        throw new Error(`Rendered worker prompt uses approximately ${promptTokens} tokens, exceeding the ${maxInputTokens}-token input budget.`);
-      }
+    let renderedPrompt = render(envelope);
+    let inputTokenEstimate = estimateTokens(renderedPrompt, tokenEstimator);
+    if (Number.isInteger(maxInputTokens) && maxInputTokens > 0 && inputTokenEstimate > maxInputTokens) {
+      // One compaction pass measured against the complete wire prompt. Subtracting
+      // independent estimates is not valid for arbitrary/custom tokenizers.
+      envelope = compactEnvelopeToBudget(envelope, {
+        inputTokens: maxInputTokens,
+        measureTokens: (candidate) => {
+          renderedPrompt = render(candidate);
+          inputTokenEstimate = estimateTokens(renderedPrompt, tokenEstimator);
+          return inputTokenEstimate;
+        },
+      });
+      contextWasCompressed = true;
     }
-    const inputTokenEstimate = estimateTokens(renderedPrompt, tokenEstimator);
     const request = {
       protocolVersion: ROUTER_PROTOCOL_VERSION,
       dispatched: false,

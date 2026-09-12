@@ -168,7 +168,8 @@ git-status       # git status --short
 安全边界：
 
 - 路径经过词法归一化后必须位于当前项目内。
-- 拒绝最终目标本身是符号链接或非普通文件；当前实现不解析中间目录的真实路径，因此项目内指向外部的目录符号链接仍属于宿主需要额外隔离的边界。
+- 对规范化项目根目录下的每一级路径执行 `lstat`，拒绝中间目录及最终目标的符号链接，要求最终目标为普通文件，并通过 `realpath` 复核目标仍在项目内。项目根本身可以使用合法别名路径。
+- 这不是抗并发路径替换的文件系统沙箱；恶意进程同时替换目录的竞态仍需宿主隔离。
 - 不执行 `npm test`、lint 脚本或任意项目代码。
 - 编译、测试和 lint 结果由 Validator 检查 Artifact 中的证据；需要执行项目代码的强验证应由受控 Harness、CI 或外部只读沙箱提供。
 
@@ -705,6 +706,8 @@ Fast Validator 失败只升级 Deep，不创建实现失败快照。
 
 进入 Context Envelope 时字段会序列化为 snake_case，例如 `decision_summary` 和 `memory_revision`。
 
+直接调用 `createFailureSnapshot()` 且未指定 ID 时，使用共享递归规范序列化加 SHA-256 生成 `fs-...` ID，完整纳入嵌套错误、验证和 Decision Summary，避免 JSON 字段白名单过滤掉关键证据。已有/显式 ID 不变；Router 默认的 UUID 工厂也保持不变。
+
 ## 13. Semantic Memory
 
 Semantic Memory 用于跨任务保留可复用经验。
@@ -785,7 +788,9 @@ taskType
 
 ### 14.4 输入预算与压缩
 
-`maxInputTokens` 对完整 `renderedPrompt` 生效，包括：
+Worker Prompt 默认使用紧凑 JSON；显式传入 `serialization: { pretty: true }` 可启用可读调试格式，不会改变字符串内部空白。
+
+`maxInputTokens` 对完整 `renderedPrompt` 生效（不包括宿主另外添加的系统提示词和工具定义），包括：
 
 - 固定 Prefix。
 - Runtime Protocol。
@@ -806,7 +811,7 @@ taskType
 - Acceptance Criteria。
 - Current Error。
 
-如果仍无法满足预算，则拒绝创建 Worker 请求，而不是静默删除必要证据。
+压缩在一次流程中直接测量完整 Prompt，不假设协议、任务和 Envelope 的 Token 估算可线性相加；相同候选的测量会缓存。如果仍无法满足预算，则拒绝创建 Worker 请求，而不是静默删除必要证据。
 
 ## 15. 模型路由与动态排名
 
@@ -882,7 +887,9 @@ Planner 支持：
 mode=inherit | mode=route
 ```
 
-Worker route 还可包含 `budgetProfile`。
+Worker route 还可包含 `budgetProfile`。它可以引用 `planner`/`root`、`luna`/`executor`、`validator` 或 `sol`/`recovery` 的基础输出预算，或显式提供 `{ "outputTokens": 1200 }`（兼容 `outputBudget`、`maxOutputTokens`、`maxTokens` 单字段对象）。复杂度倍率和 Usage Feedback 仍会生效，冻结的 thinking 不会被覆盖。未知名称、字段、冲突别名和非正数会显式拒绝；原先被静默忽略的任意 profile 需要迁移到此格式。
+
+输出预算是 `request.budget` 元数据，宿主需要将其映射到 Provider 输出限制；当前 Pi Agent API 不提供输出 Token 上限，因此 Pi 路径不是硬限额。
 
 ### 15.4 可用性与排名
 
