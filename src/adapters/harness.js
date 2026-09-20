@@ -5,6 +5,7 @@ import {
   validateWorkerOutput,
 } from "../prompt-protocol.js";
 import { ROUTER_ROLES, createRouterService } from "../router-service.js";
+import { evaluateJevRequest } from "../jev-router.js";
 
 const VALID_ROLES = new Set(Object.values(ROUTER_ROLES));
 const REQUIRED_BINDING_ROLES = [ROUTER_ROLES.LUNA, ROUTER_ROLES.SOL];
@@ -42,7 +43,7 @@ function reportFromResult(result, role, requestId) {
 }
 
 export function createHarnessPromptPrefix({ harnessName = "agent harness" } = {}) {
-  return `${CACHE_FRIENDLY_PROTOCOL_PREFIX}\n\n## Host Orchestration Protocol\n- Active host: ${harnessName}.\n- The parent plans, schedules, and makes the final decision; implementation is delegated.\n- Luna implements, Validator performs read-only checks, and Sol repairs only from the latest Failure Snapshot.\n- A worker success claim never bypasses Validator or explicit host validation.\n- The parent must enforce write restrictions using host permissions or a sandbox.`;
+  return `${CACHE_FRIENDLY_PROTOCOL_PREFIX}\n\n## Host Orchestration Protocol\n- Active host: ${harnessName}.\n- The parent plans, schedules, and makes the final decision. It may implement in explicitly selected direct mode or integrate a completed parallel batch. Otherwise implementation is delegated.\n- Jev provides advisory workflow judgments only, never permissions.\n- Luna implements, Validator performs read-only checks, and Sol repairs only from the latest Failure Snapshot.\n- A worker success claim never bypasses Validator or explicit host validation.\n- The host must enforce write restrictions and isolated parallel worktrees using host permissions or a sandbox.`;
 }
 
 export function createHarnessRuntimeContext({ harnessName = "agent harness", state, memory } = {}) {
@@ -76,6 +77,9 @@ export function createHarnessAdapter({
   saveSnapshot = async () => {},
   autoRecordValidator = true,
   strictWorkerOutput = true,
+  evaluate,
+  jevPolicy,
+  parallelIsolation,
 } = {}) {
   requireFunction(invokeWorker, "invokeWorker");
   requireFunction(saveSnapshot, "saveSnapshot");
@@ -97,6 +101,7 @@ export function createHarnessAdapter({
     budgetPolicy,
     modelRoutes,
     isModelAvailable,
+    jevPolicy,
   });
   let transactionTail = Promise.resolve();
 
@@ -352,6 +357,85 @@ export function createHarnessAdapter({
     };
   }
 
+  async function assessRoute({ kind = "entry", summary, subtasks, signal, timeoutMs } = {}) {
+    if (timeoutMs !== undefined && (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 60000)) throw new Error("Invalid Jev timeout.");
+    const prepared = await transact(async () => {
+      const update = router.prepareJevAssessment({ kind, summary, subtasks });
+      await persist(update, "jev_prepared");
+      return update;
+    });
+    const advice = await evaluateJevRequest(prepared.request, { evaluate, policy: jevPolicy, signal, timeoutMs });
+    return transact(async () => {
+      const update = router.recordJevAssessment({ assessmentId: prepared.assessmentId, response: advice.answers ? { model: advice.model, answers: advice.answers } : null, failureReason: advice.reason });
+      await persist(update, "jev_result");
+      return { ...update, advice, assessmentId: prepared.assessmentId };
+    });
+  }
+
+  async function startDirectExecution(options) {
+    return transact(async () => {
+      const update = router.startDirectExecution(options);
+      await persist(update, "direct_started");
+      return update;
+    });
+  }
+
+  async function finishParentExecution(options) {
+    return transact(async () => {
+      const update = router.finishParentExecution(options);
+      await persist(update, "parent_result");
+      return update;
+    });
+  }
+
+  async function invokeParallel({ reason, signal, routing, maxInputTokens } = {}) {
+    if (parallelIsolation !== "worktree") throw new Error("The host must explicitly support worktree isolation before parallel invocation.");
+    signal?.throwIfAborted();
+    const requests = await transact(async () => {
+      const prepared = router.prepareParallelExecution({ reason, routing, maxInputTokens });
+      try {
+        for (const request of prepared.requests) router.markWorkerDispatched({ role: "luna", requestId: request.requestId });
+        await persist(prepared, "parallel_started");
+      } catch (error) {
+        router.restore(prepared.previousSnapshot);
+        throw error;
+      }
+      return prepared.requests;
+    });
+    // The host callback MUST honor request.isolation. All starts are persisted
+    // before any launch; every executor settles before this method returns.
+    const results = await Promise.allSettled(requests.map(async (request) => {
+      let report;
+      let failure;
+      try {
+        signal?.throwIfAborted();
+        report = validateWorkerOutput("luna", await invokeWorker({
+          ...request, harnessName, role: "luna", binding: workerBindings.luna,
+          input: request.instruction, signal, request, isolation: "worktree",
+          routerState: router.getState(), snapshot: router.snapshot(),
+        }));
+      } catch (error) {
+        failure = error instanceof Error ? error.message : String(error);
+      }
+      await transact(async () => {
+        let update;
+        try {
+          update = failure
+            ? router.recordExecutorFailure({ requestId: request.requestId, reason: failure })
+            : router.recordWorkerReport({ role: "luna", requestId: request.requestId, report });
+        } catch (error) {
+          failure = error instanceof Error ? error.message : String(error);
+          update = router.recordExecutorFailure({ requestId: request.requestId, reason: failure });
+        }
+        await persist(update, "executor_result", { requestId: request.requestId });
+      });
+      return { requestId: request.requestId, subtaskId: request.subtaskId, report, failure };
+    }));
+    const persistenceFailure = results.find((entry) => entry.status === "rejected");
+    if (persistenceFailure) throw persistenceFailure.reason;
+    return { results: results.map((entry) => entry.value), orchestration: router.getOrchestration(), state: router.getState(), snapshot: router.snapshot() };
+  }
+
   async function reset(metadata = {}) {
     return transact(async () => {
       const update = router.reset();
@@ -394,6 +478,12 @@ export function createHarnessAdapter({
     retrieveRelevantMemory: router.retrieveRelevantMemory,
     getReasoningProfile: router.getReasoningProfile,
     getPolicyDecision: router.getPolicyDecision,
+    getOrchestration: router.getOrchestration,
+    canParentExecute: router.canParentExecute,
+    assessRoute,
+    startDirectExecution,
+    finishParentExecution,
+    invokeParallel,
     getModelPerformanceStore: router.getModelPerformanceStore,
     recordModelFeedback: async (feedback) => transact(async () => {
       const update = router.recordModelFeedback(feedback);

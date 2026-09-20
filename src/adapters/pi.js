@@ -46,6 +46,7 @@ import {
 } from "../model-routing.js";
 import { CACHE_FRIENDLY_PROTOCOL_PREFIX, validateWorkerOutput } from "../prompt-protocol.js";
 import { createRouterService } from "../router-service.js";
+import { registerJevRouting } from "./pi-jev.js";
 import {
   formatProjectTokenShares,
   initialProjectTokenState,
@@ -1158,20 +1159,26 @@ function resultText(text, state, details = {}) {
   };
 }
 
-const SYSTEM_PROTOCOL = `
+function systemProtocol(useJev) {
+  return `
 
 ${CACHE_FRIENDLY_PROTOCOL_PREFIX}
 
 ## Sol-Luna Host Orchestration Protocol
-- The parent is the Root Planner: understand the goal, define acceptance criteria, schedule workers, and make the final decision. The parent must not edit or write project files.
-- Start each task with sol_luna_gate(action=start_task), then call sol_luna_prepare_worker before every managed Agent call. Pass the returned rendered_prompt as the worker task without rewriting it.
+${useJev ? `- The parent is the Root Planner and may also execute: understand the goal, define acceptance criteria, choose direct execution or Plan-Act, and make the final decision. Parent edit/write/bash are available only after explicitly selecting direct execution, or while integrating a finished parallel batch.
+- For a new task, use sol_luna_route(action=entry, summary=...) to prepare a Jev judgment from a permitted summary only. Copy evaluation_request unchanged to typesafe_evaluate; actual results are correlated automatically. Never send secrets, files, or full conversation history. If unavailable, cancel_assessment and use Planner review. Jev is advisory only, not proof or permission.
+- Start each task with sol_luna_gate(action=start_task); pass jev_assessment_id to retain a completed entry assessment. Choose complexity before the task profile freezes. For clear bounded work, explicitly choose sol_luna_route(action=direct, reason=...), implement and test in this main session, then submit action=complete with an implementation report and verification evidence. Low confidence means Planner review, not automatic direct execution.
+- For Plan-Act, call sol_luna_prepare_worker before every serial managed Agent call. Pass rendered_prompt unchanged. For independent parallel subtasks, first prepare sol_luna_route(action=parallel) with acceptance, non-overlapping writeScopes and dependsOn: []; evaluate its Jev questions, then explicitly select dispatch_parallel. Launch all returned Luna requests in one batch, in isolated worktrees with run_in_background true. Correlate each report using its request_id; wait for notifications, do not poll. Never edit assigned work while executors are running. Integrate only after all reports arrive, submit complete, then run the independent Validator. Worktrees are not security sandboxes.` : `- TypeSafe is unavailable. Use the original serial Plan-Act strategy; do not request Jev assessments or automatically select direct/parallel execution. TypeSafe is optional and must not block the task.
+- The parent is the Root Planner: plan, define acceptance criteria, and delegate implementation. Do not edit or write project files.
+- Start each task with sol_luna_gate(action=start_task), then call sol_luna_prepare_worker before each managed Agent call. Pass rendered_prompt unchanged. Parent shell execution remains blocked in this serial workflow.`}
 - Luna is the default implementation worker. Validator is a new read-only worker for diff checks, tests, lint, and static analysis. A Luna or Sol success claim is not final until Validator passes.
 - After each Agent returns, call sol_luna_record_result with its exact JSON report, then record observed token/latency feedback with sol_luna_record_usage when available. Fast Validator failures escalate to Deep Validator before creating a Failure Snapshot. One failed deep Luna validation permits one new Luna retry; the second opens the circuit.
 - When the circuit opens, prepare and start exactly one new sol-worker call. Sol must consume the latest Failure Snapshot and inspect affected files rather than re-exploring the project.
 - Managed Agent calls must be immediate, inherit_context false, unscheduled, without resume or model overrides. Models and thinking levels are pinned by the project routing policy.
-- Parent bash is limited to read-only inspection or emergency compatibility validation and must never bypass write restrictions.
+${useJev ? "- Serial calls are foreground; prepared parallel executors are background and must use worktree isolation. Direct tasks may supply explicit main-agent test evidence; high-risk tasks and parallel integration still require independent validation. Parent execution privileges never override user approval or other extensions' security controls. Context compression is unchanged." : "- Managed calls use run_in_background=false. Preserve independent validation and the original Luna retry/Sol circuit. Do not install or activate TypeSafe automatically."}
 - Only the user may run /sol-luna-reset. The router state, Context Envelope, Task Memory, and Failure Snapshot are authoritative.
 `;
+}
 
 export function createPiAdapter(pi, options = {}) {
   const managedDispatches = new Map();
@@ -1180,6 +1187,7 @@ export function createPiAdapter(pi, options = {}) {
   const eligiblePlannerMessages = new Set();
   const router = createRouterService({
     taskIdFactory: () => `task-${randomUUID()}`,
+    jevPolicy: options.jevPolicy,
   });
   let activeSession = null;
   let tokenUiState = initialProjectTokenState();
@@ -1206,6 +1214,7 @@ export function createPiAdapter(pi, options = {}) {
     workerDispatchByAgentId.clear();
     pendingPlannerUsage.clear();
     eligiblePlannerMessages.clear();
+    jevBridge.clear();
   };
 
   const runtimeStateFor = (ctx) => readProjectRuntimeState(projectPaths(projectIdentity(ctx.cwd))).state;
@@ -1224,6 +1233,22 @@ export function createPiAdapter(pi, options = {}) {
       throw error;
     }
   };
+
+  const jevBridge = registerJevRouting(pi, {
+    router, persist: persistState,
+    assertEnabled: (ctx) => {
+      assertRuntimeEnabled(ctx);
+      if (ctx?.cwd && managedRuntimeState(ctx.cwd) !== "ready") throw new Error("Jev routing requires an initialized, intact Sol-Luna runtime.");
+    },
+    resolveLunaRouting: (ctx) => {
+      const template = readText(projectPaths(ctx.cwd).luna) ?? "";
+      if (/^run_in_background:\s*false\s*$/mu.test(template)) throw new Error("The installed Luna template pins foreground execution. Run /sol-luna-update before parallel dispatch.");
+      const { config } = effectiveModelRoutes(ctx, projectPaths(ctx.cwd));
+      const routing = resolveProjectModels(ctx, config, { complexity: router.getReasoningProfile()?.complexity ?? "medium" }).selections.luna;
+      if (!routing) throw new Error("No available Luna route for parallel execution.");
+      return routing;
+    },
+  });
 
   const requestTokenWidgetRender = () => tokenWidgetTui?.requestRender?.();
 
@@ -1460,11 +1485,11 @@ export function createPiAdapter(pi, options = {}) {
     return mutateActiveProjectTokens(ctx, (state) => recordProjectTokenUsage(state, { role, tokens, kind, key }));
   };
 
-  const findManagedDispatch = (role) => {
-    const pending = router.getPendingRequest();
-    if (!pending || pending.role !== role || pending.dispatched !== true) return null;
+  const findManagedDispatch = (role, description) => {
     for (const [dispatchKey, dispatch] of [...managedDispatches.entries()].reverse()) {
-      if (dispatch.role !== role || dispatch.requestId !== pending.requestId || dispatch.taskId !== pending.taskId) continue;
+      const pending = router.getPendingRequest(dispatch.requestId);
+      if (!pending || pending.role !== role || pending.dispatched !== true) continue;
+      if (description !== dispatch.expectedDescription || dispatch.role !== role || dispatch.taskId !== pending.taskId) continue;
       if (activeSession?.projectId && dispatch.projectId !== activeSession.projectId) continue;
       return { dispatchKey, dispatch };
     }
@@ -1474,7 +1499,7 @@ export function createPiAdapter(pi, options = {}) {
   const correlateWorkerStart = (event) => {
     const role = MANAGED_WORKER_ROLES.get(event?.type);
     if (!role || typeof event?.id !== "string" || !event.id) return;
-    const match = findManagedDispatch(role);
+    const match = findManagedDispatch(role, event.description);
     if (!match || event.description !== match.dispatch.expectedDescription) return;
     match.dispatch.agentId = event.id;
     workerDispatchByAgentId.set(event.id, match.dispatchKey);
@@ -1509,10 +1534,24 @@ export function createPiAdapter(pi, options = {}) {
   if (pi.events?.on) {
     pi.events.on("subagents:started", correlateWorkerStart);
     pi.events.on("subagents:completed", recordWorkerCompletion);
-    pi.events.on("subagents:failed", recordWorkerCompletion);
+    pi.events.on("subagents:failed", (event) => {
+      const key = workerDispatchByAgentId.get(event?.id);
+      const dispatch = managedDispatches.get(key);
+      recordWorkerCompletion(event);
+      if (!dispatch?.parallel || !activeSession?.ctx || !router.getPendingRequest(dispatch.requestId)) return;
+      try {
+        assertRuntimeEnabled(activeSession.ctx);
+        const update = router.recordExecutorFailure({ requestId: dispatch.requestId, reason: typeof event.error === "string" ? event.error : "Background executor failed or was stopped." });
+        persistState(update.previousSnapshot);
+      } catch {
+        // Keep the request pending on persistence/runtime failure. Never silently
+        // release a write assignment; the user can inspect state and reconcile.
+      }
+    });
   }
 
   pi.on("session_start", (_event, ctx) => {
+    jevBridge.resetNotices();
     if (activeSession?.ctx?.ui?.setWidget && tokenWidgetInstalled) {
       activeSession.ctx.ui.setWidget(TOKEN_UI_WIDGET, undefined);
     }
@@ -1610,7 +1649,14 @@ export function createPiAdapter(pi, options = {}) {
         systemPrompt: `${_event.systemPrompt}\n\n## Validator Capability Boundary\nUse sol_luna_validate only for syntax, JSON, and Git diff/status checks. Project scripts, direct shell execution, and file mutation are unavailable; report when external CI/test evidence is still required.`,
       };
     }
-    return { systemPrompt: `${_event.systemPrompt}${SYSTEM_PROTOCOL}` };
+    const fallback = jevBridge.fallbackToLegacy();
+    const activeRoutedTask = router.getOrchestration().mode !== "legacy"
+      && !["idle", "passed", "escalated"].includes(router.getState().stage);
+    const message = jevBridge.noticeOnce(ctx, fallback);
+    return {
+      systemPrompt: `${_event.systemPrompt}${systemProtocol(!fallback || activeRoutedTask)}${fallback && activeRoutedTask ? "\nTypeSafe is currently unavailable. Finish the active direct/parallel task using its persisted state; use the original serial strategy for new tasks." : ""}`,
+      ...(message ? { message } : {}),
+    };
   });
 
   pi.on("tool_call", (event, ctx) => {
@@ -1646,12 +1692,14 @@ export function createPiAdapter(pi, options = {}) {
     }
 
     if (["edit", "write", "bash"].includes(event.toolName)) {
+      if (router.canParentExecute()) return;
       return {
         block: true,
         reason: "Parent filesystem mutation and shell execution are blocked by pi-sol-luna-router. Use managed Luna/Sol workers for implementation and Validator for approved checks.",
       };
     }
 
+    if (event.toolName === "typesafe_evaluate") return jevBridge.toolCall(event);
     if (event.toolName !== "Agent") return;
     const input = event.input ?? {};
     const managedRole = MANAGED_WORKER_ROLES.get(managedWorkerAgentType(event));
@@ -1671,7 +1719,9 @@ export function createPiAdapter(pi, options = {}) {
       return { block: true, reason: "Managed workers must be new isolated calls; resume and hot-switching are blocked." };
     }
     try {
-      const pending = router.getPendingRequest();
+      const batchRequest = router.getOrchestration().requests.find((entry) => entry.renderedPrompt === input.prompt);
+      const pending = batchRequest ?? router.getPendingRequest();
+      if (batchRequest && input.isolation !== "worktree") return { block: true, reason: "Parallel executors require isolation: worktree." };
       if (!pending || pending.role !== managedRole) {
         return { block: true, reason: `No prepared ${managedRole} request is pending. Call sol_luna_prepare_worker first.` };
       }
@@ -1688,12 +1738,13 @@ export function createPiAdapter(pi, options = {}) {
         : input.model;
       input.thinking = pending.budget.thinking;
       input.inherit_context = false;
-      input.run_in_background = false;
+      input.run_in_background = Boolean(batchRequest);
       const dispatchKey = event.toolCallId ?? pending.requestId;
       managedDispatches.set(dispatchKey, {
         role: managedRole,
         requestId: pending.requestId,
         validatorMode: pending.validatorMode,
+        parallel: Boolean(batchRequest),
         taskId: pending.taskId,
         projectId: projectIdentity(ctx.cwd),
         usageCounted: false,
@@ -1707,6 +1758,7 @@ export function createPiAdapter(pi, options = {}) {
   });
 
   pi.on("tool_result", (event, ctx) => {
+    if (event.toolName === "typesafe_evaluate") return jevBridge.toolResult(event, ctx);
     if (managedRuntimeState(ctx.cwd) === "inactive" || event.toolName !== "Agent") return;
     const dispatched = managedDispatches.get(event.toolCallId);
     if (!dispatched) return;
@@ -1715,13 +1767,15 @@ export function createPiAdapter(pi, options = {}) {
       managedDispatches.delete(event.toolCallId);
       if (dispatched.agentId) workerDispatchByAgentId.delete(dispatched.agentId);
     }
-    const pending = router.getPendingRequest();
+    const pending = router.getPendingRequest(dispatched.requestId);
     if (!pending || pending.requestId !== dispatched.requestId || pending.taskId !== dispatched.taskId) return;
     if (!event.isError) return;
     try {
       const currentState = router.getState();
       const reason = event.content?.find?.((part) => part?.type === "text")?.text ?? "Managed Agent execution failed.";
-      const update = dispatched.role === "validator"
+      const update = dispatched.parallel
+        ? router.recordExecutorFailure({ requestId: dispatched.requestId, reason })
+        : dispatched.role === "validator"
         ? router.recordValidation({
             role: currentState.phase === "sol-recovery" ? "sol" : "luna",
             requestId: dispatched.requestId,
@@ -1790,6 +1844,7 @@ export function createPiAdapter(pi, options = {}) {
       action: StringEnum(["start_task", "plan_ready", "status"]),
       task_label: Type.Optional(Type.String({ description: "Short label for a new task." })),
       task_id: Type.Optional(Type.String({ description: "Stable task identifier for a new task." })),
+      jev_assessment_id: Type.Optional(Type.String({ description: "Completed entry assessment to retain when starting this task." })),
       objective: Type.Optional(Type.String({ description: "Task objective." })),
       task_type: Type.Optional(Type.String({ description: "Stable task category used for feedback and model ranking." })),
       acceptance: Type.Optional(Type.Array(Type.String(), { description: "Acceptance criteria." })),
@@ -1806,12 +1861,11 @@ export function createPiAdapter(pi, options = {}) {
       }
       if (params.action === "status") {
         const state = router.getState();
-        return resultText(formatState(state), state, { memory: router.getMemory() });
+        return resultText(formatState(state), state, { memory: router.getMemory(), orchestration: router.getOrchestration() });
       }
       let reasoningProfile;
-      if (params.action === "start_task") {
-        managedDispatches.clear();
-        workerDispatchByAgentId.clear();
+      if (params.action === "start_task" && (router.getPendingRequest() || router.getOrchestration().requests.length || router.canParentExecute() || router.getOrchestration().jev?.pending)) {
+        throw new Error("Finish active execution or resolve the pending Jev assessment before starting another task.");
       }
       if (params.action === "start_task" && ctx) {
         const { config } = effectiveModelRoutes(ctx, projectPaths(ctx.cwd));
@@ -1861,10 +1915,15 @@ export function createPiAdapter(pi, options = {}) {
               constraints: params.constraints,
               complexity: params.complexity,
               reasoningProfile,
+              jevAssessmentId: params.jev_assessment_id,
             }
           : { reason: params.reason },
       );
       persistState(update.previousSnapshot);
+      if (params.action === "start_task") {
+        managedDispatches.clear();
+        workerDispatchByAgentId.clear();
+      }
       if (pendingPlannerCandidate && ctx && pendingPlannerCandidate.projectId === projectIdentity(ctx.cwd)) {
         eligiblePlannerMessages.add(pendingPlannerCandidate.key);
       }
@@ -1878,7 +1937,7 @@ export function createPiAdapter(pi, options = {}) {
     description: "Create the role-scoped Context Envelope, token budget, Failure Snapshot reference, and cache-friendly prompt for the next managed Agent call.",
     promptSnippet: "Prepare the next Luna, Validator, or Sol worker request",
     promptGuidelines: [
-      "Call sol_luna_prepare_worker immediately before every managed Agent call and pass rendered_prompt as the Agent task unchanged.",
+      "Call sol_luna_prepare_worker immediately before each serial managed Agent call and pass rendered_prompt unchanged. Parallel requests are prepared together by sol_luna_route(action=dispatch_parallel), not by repeated serial preparation.",
     ],
     parameters: Type.Object({
       role: StringEnum(["luna", "validator", "sol"]),
@@ -1946,10 +2005,12 @@ export function createPiAdapter(pi, options = {}) {
         report = validateWorkerOutput(params.role, report);
       } catch (error) {
         const malformed = error instanceof Error ? error : new Error(String(error));
-        const pending = router.getPendingRequest();
+        const pending = router.getPendingRequest(params.request_id);
         if (pending?.role === params.role && pending.dispatched === true) {
           const currentState = router.getState();
-          const failure = params.role === "validator" && pending.validatorMode === "fast"
+          const failure = pending.subtaskId
+            ? router.recordExecutorFailure({ requestId: pending.requestId, reason: `Invalid executor output: ${malformed.message}` })
+            : params.role === "validator" && pending.validatorMode === "fast"
             ? router.recordValidation({
                 role: currentState.phase === "sol-recovery" ? "sol" : "luna",
                 requestId: pending.requestId,

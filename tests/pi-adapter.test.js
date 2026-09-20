@@ -84,7 +84,7 @@ function validatorReport(overrides = {}) {
   };
 }
 
-function createFakePi() {
+function createFakePi({ typesafeAvailable = false } = {}) {
   const events = new Map();
   const tools = new Map();
   const commands = new Map();
@@ -113,7 +113,7 @@ function createFakePi() {
       if (failAppend) throw new Error("session store unavailable");
       entries.push({ type, data });
     },
-    getAllTools() { return agentToolPresent ? [{ name: "Agent" }] : []; },
+    getAllTools() { return [...(agentToolPresent ? [{ name: "Agent" }] : []), ...(typesafeAvailable ? [{ name: "typesafe_evaluate" }] : [])]; },
     setThinkingLevel(level) { thinkingLevels.push(level); },
     async setModel(model) { selectedModels.push(model); return true; },
     async exec(command, args) { return { stdout: `${command} ${args.join(" ")}`, stderr: "", code: 0 }; },
@@ -123,6 +123,7 @@ function createFakePi() {
     emitShared(name, data) { pi.events.emit(name, data); },
     setFailAppend(value) { failAppend = value; },
     setAgentToolPresent(value) { agentToolPresent = value; },
+    setTypeSafeAvailable(value) { typesafeAvailable = value; },
   };
 }
 
@@ -258,6 +259,7 @@ test("Pi adapter registers v2 tools and materializes Luna, Validator, and Sol", 
     "sol_luna_prepare_worker",
     "sol_luna_record_result",
     "sol_luna_record_usage",
+    "sol_luna_route",
     "sol_luna_validate",
   ]);
   assert.deepEqual([...fake.commands.keys()].sort(), [
@@ -1450,6 +1452,257 @@ test("managed worker lifecycle events add project-local token totals exactly onc
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("missing TypeSafe uses the original serial circuit and gives one optional-install reminder", { skip: skipWithoutPiPeers }, async () => {
+  const fake = createFakePi(); piModule.createPiAdapter(fake.pi);
+  const root = mkdtempSync(join(tmpdir(), "sol-luna-no-typesafe-"));
+  try {
+    const ctx = commandContext(root);
+    await fake.commands.get("sol-luna-init").handler("", ctx);
+    fake.pi.exec = async () => { throw new Error("Fallback must not execute installation or shell commands"); };
+    const first = fake.events.get("before_agent_start")({ systemPrompt: "BASE" }, ctx);
+    assert.match(first.systemPrompt, /original serial Plan-Act/);
+    assert.doesNotMatch(first.systemPrompt, /sol_luna_route\(action=entry/);
+    assert.equal(first.message.display, true);
+    assert.match(first.message.content, /Optional installation: pi install -l npm:pi-typesafe/);
+    assert.equal(fake.events.get("before_agent_start")({ systemPrompt: "BASE" }, ctx).message, undefined);
+    const route = (params) => fake.tools.get("sol_luna_route").execute("route", params, undefined, undefined, ctx);
+    const entry = await route({ action: "entry", summary: "Fix typo" });
+    assert.equal(entry.details.strategy, "legacy");
+    assert.equal(entry.details.source, "policy");
+    assert.equal(entry.details.reason, "typesafe_missing");
+    assert.equal(entry.details.evaluation_request, undefined);
+    assert.equal(entry.details.assessment_id, undefined);
+    assert.equal((await route({ action: "status" })).details.jev.pending, null);
+    await fake.tools.get("sol_luna_gate").execute("start", { action: "start_task", objective: "Fix typo" }, undefined, undefined, ctx);
+    for (const action of ["parallel", "dispatch_parallel"]) assert.equal((await route({ action })).details.strategy, "legacy");
+    assert.equal(fake.events.get("tool_call")({ toolName: "edit", input: {} }, ctx).block, true);
+    for (const role of ["luna", "validator"]) {
+      const prepared = await fake.tools.get("sol_luna_prepare_worker").execute("prepare", { role, instruction: "Do the assigned work" }, undefined, undefined, ctx);
+      assert.ok(prepared.details.request_id);
+      const input = { subagent_type: `${role}-worker`, prompt: prepared.details.rendered_prompt };
+      assert.equal(fake.events.get("tool_call")({ toolName: "Agent", toolCallId: role, input }, ctx), undefined);
+      assert.equal(input.run_in_background, false);
+      const report = role === "luna" ? implementationReport() : validatorReport();
+      const recorded = await fake.tools.get("sol_luna_record_result").execute("record", { role, request_id: prepared.details.request_id, report_json: JSON.stringify(report) }, undefined, undefined, ctx);
+      assert.equal(recorded.details.state.stage, role === "luna" ? "validating" : "passed");
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("TypeSafe removal releases a pending judgment and late results cannot grant permissions", { skip: skipWithoutPiPeers }, async () => {
+  const fake = createFakePi({ typesafeAvailable: true }); piModule.createPiAdapter(fake.pi);
+  const root = mkdtempSync(join(tmpdir(), "sol-luna-typesafe-removed-"));
+  try {
+    const ctx = commandContext(root);
+    await fake.commands.get("sol-luna-init").handler("", ctx);
+    const route = (params) => fake.tools.get("sol_luna_route").execute("route", params, undefined, undefined, ctx);
+    const prepared = await route({ action: "entry", summary: "Task" });
+    fake.events.get("tool_call")({ toolName: "typesafe_evaluate", toolCallId: "late", input: prepared.details.evaluation_request }, ctx);
+    fake.setTypeSafeAvailable(false);
+    assert.match(fake.events.get("before_agent_start")({ systemPrompt: "BASE" }, ctx).systemPrompt, /original serial/);
+    assert.equal((await route({ action: "status" })).details.jev.pending, null);
+    assert.equal(fake.events.get("tool_result")({ toolName: "typesafe_evaluate", toolCallId: "late", details: jevResponse(prepared.details.evaluation_request), content: [] }, ctx), undefined);
+    assert.equal(fake.events.get("tool_call")({ toolName: "edit", input: {} }, ctx).block, true);
+    await fake.tools.get("sol_luna_gate").execute("start", { action: "start_task", objective: "Task" }, undefined, undefined, ctx);
+    fake.setTypeSafeAvailable(true);
+    assert.match(fake.events.get("before_agent_start")({ systemPrompt: "BASE" }, ctx).systemPrompt, /sol_luna_route\(action=entry/);
+    assert.ok((await route({ action: "entry", summary: "Task" })).details.evaluation_request);
+    // Directly calling the route tool also handles removal, without a new turn.
+    fake.setTypeSafeAvailable(false);
+    assert.equal((await route({ action: "entry", summary: "Task" })).details.strategy, "legacy");
+    assert.equal((await route({ action: "status" })).details.jev.pending, null);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("inactive or undiscoverable TypeSafe degrades without claiming it needs reinstalling", { skip: skipWithoutPiPeers }, async () => {
+  const fake = createFakePi({ typesafeAvailable: true }); piModule.createPiAdapter(fake.pi);
+  const root = mkdtempSync(join(tmpdir(), "sol-luna-typesafe-inactive-"));
+  try {
+    const ctx = commandContext(root);
+    await fake.commands.get("sol-luna-init").handler("", ctx);
+    const route = (params) => fake.tools.get("sol_luna_route").execute("route", params, undefined, undefined, ctx);
+    fake.pi.getActiveTools = () => ["Agent"];
+    const inactive = await route({ action: "entry", summary: "Task" });
+    assert.equal(inactive.details.reason, "typesafe_inactive");
+    assert.doesNotMatch(inactive.details.notice, /pi install/);
+    fake.pi.getActiveTools = () => ["Agent", "typesafe_evaluate"];
+    assert.ok((await route({ action: "entry", summary: "Task" })).details.evaluation_request);
+    await route({ action: "cancel_assessment" });
+    fake.pi.getAllTools = () => { throw new Error("tool registry unavailable"); };
+    assert.equal((await route({ action: "entry", summary: "Task" })).details.reason, "typesafe_discovery_unavailable");
+    assert.equal((await route({ action: "status" })).details.jev.pending, null);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("fallback persistence failures preserve the pending judgment for safe recovery", { skip: skipWithoutPiPeers }, async () => {
+  const fake = createFakePi({ typesafeAvailable: true }); piModule.createPiAdapter(fake.pi);
+  const root = mkdtempSync(join(tmpdir(), "sol-luna-typesafe-persist-"));
+  try {
+    const ctx = commandContext(root);
+    await fake.commands.get("sol-luna-init").handler("", ctx);
+    const route = (params) => fake.tools.get("sol_luna_route").execute("route", params, undefined, undefined, ctx);
+    const prepared = await route({ action: "entry", summary: "Task" });
+    fake.setTypeSafeAvailable(false); fake.setFailAppend(true);
+    await assert.rejects(route({ action: "entry", summary: "Task" }), /store unavailable/);
+    assert.equal((await route({ action: "status" })).details.jev.pending.assessmentId, prepared.details.assessment_id);
+    fake.setFailAppend(false);
+    assert.equal((await route({ action: "entry", summary: "Task" })).details.strategy, "legacy");
+    assert.equal((await route({ action: "status" })).details.jev.pending, null);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+function jevResponse(request, choice = "direct") {
+  return { model: "jev-1.13.0", answers: Object.fromEntries(Object.entries(request.questions).map(([id, question]) => {
+    const keys = Object.keys(question.criteria);
+    const selected = id === "entry" ? choice : keys[0];
+    return [id, { type: "choice", choice: selected, confidence: 0.99, probabilities: Object.fromEntries(keys.map((key) => [key, key === selected ? 1 : 0])) }];
+  })) };
+}
+
+test("Pi correlates actual Jev tool results without granting permissions and supports direct execution", { skip: skipWithoutPiPeers }, async () => {
+  const fake = createFakePi({ typesafeAvailable: true }); piModule.createPiAdapter(fake.pi);
+  const root = mkdtempSync(join(tmpdir(), "sol-luna-jev-direct-"));
+  try {
+    const ctx = commandContext(root);
+    await fake.commands.get("sol-luna-init").handler("", ctx);
+    const route = (params) => fake.tools.get("sol_luna_route").execute("route", params, undefined, undefined, ctx);
+    const prepared = await route({ action: "entry", summary: "Fix a local typo" });
+    const request = prepared.details.evaluation_request;
+    fake.events.get("tool_result")({ toolName: "typesafe_evaluate", toolCallId: "unrelated", details: jevResponse(request), content: [] }, ctx);
+    assert.ok((await route({ action: "status" })).details.jev.pending);
+    fake.events.get("tool_call")({ toolName: "typesafe_evaluate", toolCallId: "actual", input: request }, ctx);
+    assert.equal(fake.events.get("tool_call")({ toolName: "typesafe_evaluate", toolCallId: "duplicate", input: request }, ctx).block, true);
+    const reply = fake.events.get("tool_result")({ toolName: "typesafe_evaluate", toolCallId: "actual", details: jevResponse(request), content: [] }, ctx);
+    assert.equal(reply.details.routingAdvice.recommendation, "direct");
+    assert.equal(fake.events.get("tool_call")({ toolName: "edit", input: {} }, ctx).block, true);
+    await fake.tools.get("sol_luna_gate").execute("start", { action: "start_task", objective: "Fix typo", complexity: "low", jev_assessment_id: prepared.details.assessment_id }, undefined, undefined, ctx);
+    await route({ action: "direct", reason: "Explicit root decision for local change" });
+    assert.equal(fake.events.get("tool_call")({ toolName: "edit", input: {} }, ctx), undefined);
+    assert.equal(fake.events.get("tool_call")({ toolName: "bash", input: {} }, ctx), undefined);
+    fake.setTypeSafeAvailable(false);
+    assert.match(fake.events.get("before_agent_start")({ systemPrompt: "BASE" }, ctx).systemPrompt, /Finish the active direct\/parallel task/);
+    assert.equal(fake.events.get("tool_call")({ toolName: "edit", input: {} }, ctx), undefined);
+    await route({ action: "complete", report_json: JSON.stringify(implementationReport()), validation_json: JSON.stringify(validatorReport({ tests: [{ command: "node --test", passed: true, evidence: "passed" }] })) });
+    assert.equal(fake.events.get("tool_call")({ toolName: "write", input: {} }, ctx).block, true);
+    assert.equal((await route({ action: "status" })).details.status, "passed");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("Pi Jev errors fall back, cancellation rejects late results, and persistence fails closed", { skip: skipWithoutPiPeers }, async () => {
+  const fake = createFakePi({ typesafeAvailable: true }); piModule.createPiAdapter(fake.pi);
+  const root = mkdtempSync(join(tmpdir(), "sol-luna-jev-errors-"));
+  try {
+    const ctx = commandContext(root);
+    await fake.commands.get("sol-luna-init").handler("", ctx);
+    const route = (params) => fake.tools.get("sol_luna_route").execute("route", params, undefined, undefined, ctx);
+    let prepared = await route({ action: "entry", summary: "Task" });
+    fake.events.get("tool_call")({ toolName: "typesafe_evaluate", toolCallId: "error", input: prepared.details.evaluation_request }, ctx);
+    const failed = fake.events.get("tool_result")({ toolName: "typesafe_evaluate", toolCallId: "error", isError: true, content: [] }, ctx);
+    assert.equal(failed.details.routingAdvice.recommendation, "planner_review");
+    prepared = await route({ action: "entry", summary: "Other task" });
+    fake.events.get("tool_call")({ toolName: "typesafe_evaluate", toolCallId: "late", input: prepared.details.evaluation_request }, ctx);
+    await route({ action: "cancel_assessment" });
+    fake.events.get("tool_result")({ toolName: "typesafe_evaluate", toolCallId: "late", details: jevResponse(prepared.details.evaluation_request), content: [] }, ctx);
+    assert.equal((await route({ action: "status" })).details.jev.entry.advice.recommendation, "planner_review");
+    await fake.tools.get("sol_luna_gate").execute("start", { action: "start_task", objective: "Task" }, undefined, undefined, ctx);
+    fake.setFailAppend(true);
+    await assert.rejects(route({ action: "direct", reason: "Main chooses" }), /store unavailable/);
+    fake.setFailAppend(false);
+    assert.equal(fake.events.get("tool_call")({ toolName: "edit", input: {} }, ctx).block, true);
+    await fake.commands.get("sol-luna-disable").handler("", ctx);
+    await assert.rejects(route({ action: "entry", summary: "Task" }), /paused/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("oversized routing output rolls back before persistence without leaving a Jev wait", { skip: skipWithoutPiPeers }, async () => {
+  const fake = createFakePi({ typesafeAvailable: true }); piModule.createPiAdapter(fake.pi);
+  const root = mkdtempSync(join(tmpdir(), "sol-luna-routing-output-"));
+  try {
+    const ctx = commandContext(root);
+    await fake.commands.get("sol-luna-init").handler("", ctx);
+    await fake.tools.get("sol_luna_gate").execute("start", { action: "start_task", objective: "Independent modules" }, undefined, undefined, ctx);
+    const route = (params) => fake.tools.get("sol_luna_route").execute("route", params, undefined, undefined, ctx);
+    const before = (await route({ action: "status" })).details;
+    const entryCount = fake.entries.length;
+    const subtasks = Array.from({ length: 4 }, (_, index) => ({ id: `task-${index}`, instruction: "长".repeat(3900), acceptance: ["Tests pass"], writeScopes: [`src/${index}.js`], dependsOn: [] }));
+    await assert.rejects(route({ action: "parallel", summary: "Independent modules", subtasks }), /Routing output exceeds 48 KiB/);
+    assert.deepEqual((await route({ action: "status" })).details, before);
+    assert.equal(fake.entries.length, entryCount);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("Pi parallel dispatch is background, isolated, separately correlated, and joins before integration", { skip: skipWithoutPiPeers }, async () => {
+  const fake = createFakePi({ typesafeAvailable: true }); piModule.createPiAdapter(fake.pi);
+  const root = mkdtempSync(join(tmpdir(), "sol-luna-jev-parallel-"));
+  try {
+    const ctx = commandContext(root);
+    await fake.commands.get("sol-luna-init").handler("", ctx);
+    assert.doesNotMatch(readFileSync(join(root, configDirName, "agents/luna-worker.md"), "utf8"), /^run_in_background:/m);
+    await fake.tools.get("sol_luna_gate").execute("start", { action: "start_task", objective: "Independent modules" }, undefined, undefined, ctx);
+    const route = (params) => fake.tools.get("sol_luna_route").execute("route", params, undefined, undefined, ctx);
+    const prepared = await route({ action: "parallel", summary: "Independent modules", subtasks: ["a", "b"].map((id) => ({ id, instruction: `Implement ${id}`, acceptance: ["tests pass"], dependsOn: [], writeScopes: [`src/${id}.js`] })) });
+    fake.events.get("tool_call")({ toolName: "typesafe_evaluate", toolCallId: "judge", input: prepared.details.evaluation_request }, ctx);
+    fake.events.get("tool_result")({ toolName: "typesafe_evaluate", toolCallId: "judge", details: jevResponse(prepared.details.evaluation_request), content: [] }, ctx);
+    await assert.rejects(route({ action: "dispatch_parallel", reason: "Dirty repository must not launch" }), /clean, committed/);
+    fake.pi.exec = async () => ({ stdout: "", stderr: "", code: 0 });
+    const batch = await route({ action: "dispatch_parallel", reason: "Dispatch independent work in isolated copies" });
+    const requests = batch.details.requests;
+    for (const [index, request] of requests.entries()) {
+      const input = { subagent_type: "luna-worker", prompt: request.renderedPrompt };
+      assert.equal(fake.events.get("tool_call")({ toolName: "Agent", toolCallId: `bad-${index}`, input }, ctx).block, true);
+      input.isolation = "worktree";
+      assert.equal(fake.events.get("tool_call")({ toolName: "Agent", toolCallId: `agent-${index}`, input }, ctx), undefined);
+      assert.equal(input.run_in_background, true);
+      assert.equal(input.inherit_context, false);
+      fake.events.get("tool_result")({ toolName: "Agent", toolCallId: `agent-${index}`, isError: false, content: [] }, ctx);
+    }
+    assert.equal(fake.events.get("tool_call")({ toolName: "edit", input: {} }, ctx).block, true);
+    await assert.rejects(route({ action: "complete", report_json: JSON.stringify(implementationReport()) }), /ready/);
+    fake.setTypeSafeAvailable(false);
+    assert.match(fake.events.get("before_agent_start")({ systemPrompt: "BASE" }, ctx).systemPrompt, /Finish the active direct\/parallel task/);
+    assert.equal((await route({ action: "status" })).details.requests.length, 2);
+    for (const request of [...requests].reverse()) await fake.tools.get("sol_luna_record_result").execute("record", { role: "luna", request_id: request.requestId, report_json: JSON.stringify(implementationReport()) }, undefined, undefined, ctx);
+    assert.equal(fake.events.get("tool_call")({ toolName: "edit", input: {} }, ctx), undefined);
+    await route({ action: "complete", report_json: JSON.stringify(implementationReport()) });
+    assert.equal(fake.events.get("tool_call")({ toolName: "bash", input: {} }, ctx).block, true);
+    assert.equal((await route({ action: "status" })).details.status, "validating");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("Pi background failures and malformed reports settle only their own executor", { skip: skipWithoutPiPeers }, async () => {
+  const fake = createFakePi({ typesafeAvailable: true }); piModule.createPiAdapter(fake.pi);
+  const root = mkdtempSync(join(tmpdir(), "sol-luna-jev-failures-"));
+  try {
+    const ctx = commandContext(root);
+    await fake.commands.get("sol-luna-init").handler("", ctx);
+    fake.events.get("session_start")({}, ctx);
+    await fake.tools.get("sol_luna_gate").execute("start", { action: "start_task", objective: "Independent modules" }, undefined, undefined, ctx);
+    const route = (params) => fake.tools.get("sol_luna_route").execute("route", params, undefined, undefined, ctx);
+    const prepared = await route({ action: "parallel", summary: "Independent modules", subtasks: ["a", "b"].map((id) => ({ id, instruction: `Implement ${id}`, acceptance: ["tests pass"], dependsOn: [], writeScopes: [`src/${id}.js`] })) });
+    fake.events.get("tool_call")({ toolName: "typesafe_evaluate", toolCallId: "judge", input: prepared.details.evaluation_request }, ctx);
+    fake.events.get("tool_result")({ toolName: "typesafe_evaluate", toolCallId: "judge", details: jevResponse(prepared.details.evaluation_request), content: [] }, ctx);
+    fake.pi.exec = async () => ({ stdout: "", stderr: "", code: 0 });
+    const { requests } = (await route({ action: "dispatch_parallel", reason: "independent work" })).details;
+    for (const [index, request] of requests.entries()) {
+      const input = { subagent_type: "luna-worker", prompt: request.renderedPrompt, isolation: "worktree" };
+      fake.events.get("tool_call")({ toolName: "Agent", toolCallId: `call-${index}`, input }, ctx);
+      fake.emitShared("subagents:started", { id: `agent-${index}`, type: "luna-worker", description: input.description });
+      fake.events.get("tool_result")({ toolName: "Agent", toolCallId: `call-${index}`, isError: false, content: [] }, ctx);
+    }
+    fake.emitShared("subagents:failed", { id: "agent-0", type: "luna-worker", error: "No output produced" });
+    fake.emitShared("subagents:failed", { id: "agent-0", type: "luna-worker", error: "Duplicate notification" });
+    assert.equal((await route({ action: "status" })).details.requests.length, 1);
+    assert.equal(fake.events.get("tool_call")({ toolName: "edit", input: {} }, ctx).block, true);
+    await assert.rejects(fake.tools.get("sol_luna_record_result").execute("bad", { role: "luna", request_id: requests[1].requestId, report_json: "not JSON" }, undefined, undefined, ctx));
+    const final = (await route({ action: "status" })).details;
+    assert.equal(final.requests.length, 0);
+    assert.equal(final.status, "failed");
+    assert.equal(final.reports.length, 2);
+    const status = await fake.tools.get("sol_luna_gate").execute("status", { action: "status" }, undefined, undefined, ctx);
+    assert.equal(status.details.state.lunaValidationFailures, 1);
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test("initialization reports unavailable model routes without writing files", { skip: skipWithoutPiPeers }, async () => {

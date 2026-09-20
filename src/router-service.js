@@ -19,7 +19,8 @@ import {
   recordWorkerReport as updateWorkerMemory,
   startTaskMemory,
 } from "./task-memory.js";
-import { renderWorkerPrompt } from "./prompt-protocol.js";
+import { renderWorkerPrompt, validateWorkerOutput } from "./prompt-protocol.js";
+import { buildJevRequest, interpretJevResponse, jevRequestKey, normalizeJevPolicy, normalizeParallelTasks, withinWriteScopes } from "./jev-router.js";
 import { evaluateExecutionPolicy, freezeReasoningProfile } from "./execution-policy.js";
 import { addSemanticEntry, retrieveSemanticMemory } from "./semantic-memory.js";
 import { createRuntimeEvent, emitRuntimeEvent } from "./runtime-events.js";
@@ -57,6 +58,16 @@ function copyState(state) {
 
 function statesEqual(left, right) {
   return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function initialOrchestration(jev = {}) {
+  return { mode: "legacy", status: "idle", requests: [], reports: [], jev };
+}
+
+// The same completion rule applies to direct work, batch joins and restored joins.
+// Schema, request identity and write-scope validation remain separate boundaries.
+function implementationFailed(report) {
+  return report.status !== "success" || report.current_error || report.tests?.some((test) => !test.passed);
 }
 
 function normalizeRole(role) {
@@ -116,6 +127,7 @@ export function createRouterService({
   modelScorer,
   modelPerformanceStore,
   eventSink,
+  jevPolicy,
 } = {}) {
   for (const [name, value] of Object.entries({
     taskIdFactory,
@@ -134,6 +146,8 @@ export function createRouterService({
   let state = initialState();
   let memory = initialTaskMemory();
   let pendingRequest = null;
+  const routingPolicy = normalizeJevPolicy(jevPolicy);
+  let orchestration = initialOrchestration();
   let revision = 0;
   let latestPolicyDecision = null;
   let performanceStore = normalizeModelPerformanceStore(modelPerformanceStore);
@@ -146,8 +160,22 @@ export function createRouterService({
     return clone(memory);
   }
 
-  function getPendingRequest() {
-    return clone(pendingRequest);
+  function getPendingRequest(requestId) {
+    if (requestId && orchestration.mode === "parallel") {
+      const request = orchestration.requests.find((entry) => entry.requestId === requestId);
+      if (request) return clone(request);
+    }
+    return !requestId || pendingRequest?.requestId === requestId ? clone(pendingRequest) : null;
+  }
+
+  function getOrchestration() {
+    return clone(orchestration);
+  }
+
+  function canParentExecute() {
+    if (state.phase !== "luna" || state.stage !== "executing" || pendingRequest || orchestration.requests.length) return false;
+    return (orchestration.mode === "direct" && orchestration.status === "executing")
+      || (orchestration.mode === "parallel" && orchestration.status === "integrating");
   }
 
   function getReasoningProfile() {
@@ -205,6 +233,7 @@ export function createRouterService({
         ...getState(),
         memory: getMemory(),
         pendingRequest: getPendingRequest(),
+        orchestration: getOrchestration(),
         policyDecision: getPolicyDecision(),
         modelPerformanceStore: clone(performanceStore),
         revision,
@@ -217,7 +246,26 @@ export function createRouterService({
       && Object.prototype.hasOwnProperty.call(snapshotOrState, "state")
       ? snapshotOrState.state
       : snapshotOrState;
-    state = normalizeState(source);
+    const restoredState = normalizeState(source);
+    const restoredOrchestration = source?.orchestration ? clone(source.orchestration) : initialOrchestration();
+    if (!["legacy", "direct", "parallel"].includes(restoredOrchestration.mode)
+      || !["idle", "executing", "integrating", "validating", "failed", "passed"].includes(restoredOrchestration.status)
+      || !Array.isArray(restoredOrchestration.requests) || restoredOrchestration.requests.length > 8
+      || !Array.isArray(restoredOrchestration.reports) || restoredOrchestration.reports.length > 8
+      || (restoredOrchestration.mode !== "legacy" && !restoredState.taskId)
+      || (restoredOrchestration.mode !== "parallel" && restoredOrchestration.requests.length)
+      || restoredOrchestration.requests.some((entry) => !entry || entry.role !== "luna" || !nonEmptyString(entry.requestId)
+        || !nonEmptyString(entry.subtaskId) || !nonEmptyString(entry.renderedPrompt) || entry.isolation !== "worktree"
+        || entry.taskId !== restoredState.taskId || entry.contextId !== restoredState.contextId
+        || !Array.isArray(entry.writeScopes) || !entry.writeScopes.length)
+      || new Set(restoredOrchestration.requests.map((entry) => entry.requestId)).size !== restoredOrchestration.requests.length
+      || restoredOrchestration.reports.some((entry) => !entry?.report || !nonEmptyString(entry.requestId))) throw new Error("Invalid orchestration snapshot.");
+    if (restoredOrchestration.status === "integrating" && (restoredOrchestration.mode !== "parallel"
+      || restoredOrchestration.requests.length || restoredOrchestration.reports.length < 2
+      || restoredOrchestration.reports.length !== restoredOrchestration.subtasks?.length
+      || restoredOrchestration.reports.some((entry) => implementationFailed(entry.report)))) throw new Error("Invalid parallel integration snapshot.");
+    state = restoredState;
+    orchestration = restoredOrchestration;
     memory = normalizeTaskMemory(source?.memory ?? {
       runtime: {
         taskId: state.taskId,
@@ -270,8 +318,15 @@ export function createRouterService({
   function gate(action, payload = {}) {
     const previous = capturePrevious();
     if (action === "status") return updateResult(previous);
+    if (orchestration.requests.length || canParentExecute()) {
+      throw new Error("Finish active direct/parallel execution before changing the task or circuit.");
+    }
 
     if (action === "start_task") {
+      if (pendingRequest) throw new Error("Cannot replace a task with a pending worker.");
+      if (orchestration.jev?.pending) throw new Error("Resolve or cancel the pending Jev assessment before starting a task.");
+      const entryAssessment = payload.jevAssessmentId ? orchestration.jev?.entry : null;
+      if (payload.jevAssessmentId && entryAssessment?.assessmentId !== payload.jevAssessmentId) throw new Error("Unknown or stale Jev entry assessment.");
       const taskId = payload.taskId ?? taskIdFactory(payload);
       const contextId = payload.contextId ?? contextIdFactory({ ...payload, taskId });
       const reasoningProfile = freezeReasoningProfile({
@@ -294,6 +349,7 @@ export function createRouterService({
         currentTask: payload.currentTask ?? payload.taskLabel ?? payload.objective ?? "",
       });
       pendingRequest = null;
+      orchestration = initialOrchestration(entryAssessment ? { entry: clone(entryAssessment) } : {});
       latestPolicyDecision = safeEvaluatePolicy({ state, memory, reasoningProfile });
       revision += 1;
       emitLifecycle("task_started", { role: "planner", metadata: { complexity: reasoningProfile.complexity } });
@@ -437,6 +493,9 @@ export function createRouterService({
     if (!currentTask) throw new Error("A non-empty worker instruction is required.");
 
     const previous = capturePrevious();
+    if (orchestration.requests.length || canParentExecute() || orchestration.jev?.pending) {
+      return { allowed: false, reason: "Resolve the pending Jev assessment or finish direct/parallel execution before another worker can start.", request: null, ...updateResult(previous) };
+    }
     let reasoningProfile = state.reasoningProfile ?? memory.runtime.reasoningProfile;
     if (!reasoningProfile) {
       reasoningProfile = freezeReasoningProfile({ taskId: state.taskId, complexity: complexity ?? "medium" }, { revision: revision + 1 });
@@ -614,6 +673,14 @@ export function createRouterService({
     const normalizedRole = normalizeRole(role);
     const previous = capturePrevious();
     const effectiveRequestId = requestId ?? pendingRequest?.requestId;
+    const parallel = orchestration.requests.find((entry) => entry.requestId === effectiveRequestId);
+    if (parallel) {
+      if (normalizedRole !== "luna") throw new Error("Parallel requests belong to Luna executors.");
+      if (parallel.dispatched) return { allowed: false, reason: "Executor already dispatched.", ...updateResult(previous) };
+      parallel.dispatched = true;
+      revision += 1;
+      return { allowed: true, ...updateResult(previous) };
+    }
     requirePending(normalizedRole, effectiveRequestId);
     if (pendingRequest.dispatched === true) {
       return {
@@ -643,6 +710,10 @@ export function createRouterService({
     const normalizedRole = normalizeRole(role);
     if (normalizedRole === ROUTER_ROLES.VALIDATOR) {
       throw new Error("Use recordValidation() for validator reports.");
+    }
+    if (orchestration.requests.some((entry) => entry.requestId === requestId)) {
+      if (normalizedRole !== "luna") throw new Error("Parallel reports must identify a Luna executor.");
+      return recordExecutorReport({ requestId, report });
     }
     const previous = capturePrevious();
     if (!pendingRequest) throw new Error(`No pending ${normalizedRole} worker request exists.`);
@@ -755,6 +826,143 @@ export function createRouterService({
       emitLifecycle("snapshot_created", { role: implementationRole, metadata: { snapshotId, validatorMode: validationMode } });
       if (state.phase === "escalated") emitLifecycle("task_escalated", { role: "sol", metadata: { reason } });
     }
+    if (orchestration.mode !== "legacy") orchestration.status = passed ? "passed" : "failed";
+    revision += 1;
+    return updateResult(previous);
+  }
+
+  function assertPlanning() {
+    if (state.stage !== "planning" || pendingRequest || orchestration.requests.length || canParentExecute()) {
+      throw new Error("This operation requires an idle planning stage, with no active execution.");
+    }
+  }
+
+  function prepareJevAssessment({ kind = "entry", summary, subtasks } = {}) {
+    const previous = capturePrevious();
+    if (orchestration.jev?.pending) throw new Error("A Jev assessment is already pending; record or cancel it first.");
+    if (kind === "parallel") assertPlanning();
+    else if (!["idle", "planning", "passed", "escalated"].includes(state.stage) || pendingRequest || canParentExecute()) throw new Error("Entry assessment is unavailable during execution.");
+    const request = buildJevRequest({ kind, summary, subtasks, policy: routingPolicy });
+    const tasks = kind === "parallel" ? clone(Object.values(request.state.subtasks)) : null;
+    const assessmentId = `jev-${randomUUID()}`;
+    orchestration.jev = { ...orchestration.jev, pending: { assessmentId, kind, request, key: jevRequestKey(request), subtasks: tasks } };
+    revision += 1;
+    return { assessmentId, request: clone(request), ...updateResult(previous) };
+  }
+
+  function recordJevAssessment({ assessmentId, response, failureReason } = {}) {
+    const previous = capturePrevious();
+    const pending = orchestration.jev?.pending;
+    if (!pending || pending.assessmentId !== assessmentId) throw new Error("Stale or missing Jev assessment.");
+    const advice = interpretJevResponse(pending.request, response, routingPolicy);
+    if (!advice.answers && ["evaluation_unavailable", "cancelled"].includes(failureReason)) advice.reason = failureReason;
+    orchestration.jev = {
+      ...orchestration.jev, pending: null,
+      [pending.kind]: { assessmentId, advice, summary: pending.request.state.task.summary, subtasks: pending.subtasks },
+    };
+    revision += 1;
+    return { advice: clone(advice), ...updateResult(previous) };
+  }
+
+  // Only an explicit host/main-agent operation selects an execution mode.
+  // Jev results never call this method or grant tool capabilities.
+  function startDirectExecution({ reason } = {}) {
+    const previous = capturePrevious();
+    assertPlanning();
+    if (!nonEmptyString(reason)) throw new Error("A main-agent decision reason is required.");
+    if (orchestration.jev?.pending) throw new Error("Resolve or cancel the pending Jev assessment first.");
+    const decision = safeEvaluatePolicy({ state, memory, reasoningProfile: getReasoningProfile(), action: "run_luna", role: "luna" });
+    if (!decision.allowed) throw new Error(decision.reason || "Implementation is not authorized by the execution policy.");
+    state = transitionState(state, "worker_started", { role: "luna" });
+    state = { ...state, activeRole: "planner" };
+    orchestration = { ...orchestration, mode: "direct", status: "executing", reason, reports: [] };
+    memory = runtimeMemory(memory, state, "planner", "executing");
+    revision += 1;
+    return updateResult(previous);
+  }
+
+  function prepareParallelExecution({ reason, routing, maxInputTokens } = {}) {
+    const previous = capturePrevious();
+    assertPlanning();
+    if (!nonEmptyString(reason)) throw new Error("An explicit main-agent dispatch reason is required.");
+    const assessment = orchestration.jev?.parallel;
+    if (orchestration.jev?.pending || assessment?.advice?.recommendation !== "parallel") throw new Error("A completed Jev parallel recommendation is required; otherwise use serial execution.");
+    const tasks = normalizeParallelTasks(assessment.subtasks, routingPolicy);
+    const base = currentSnapshot();
+    // Independent child request preparation reuses the existing prompts, budget,
+    // policy, and model routing without consuming multiple parent retry attempts.
+    const requests = tasks.map((task) => {
+      const child = createRouterService({
+        snapshot: base, requestIdFactory, budgetPolicy, modelRoutes, isModelAvailable,
+        executionPolicy, memoryRetriever, modelRanker, modelScorer, jevPolicy: routingPolicy,
+      });
+      const instruction = `${task.instruction}\n\nSubtask: ${task.id}\nWrite scopes: ${JSON.stringify(task.writeScopes)}\nAcceptance: ${JSON.stringify(task.acceptance)}\nUse an isolated worktree. Do not edit outside these scopes. Report changed_files as literal project-relative paths, not absolute worktree paths. Do not merge into the main worktree; report your worktree/branch and integration instructions in changes. The main agent performs integration and global validation.`;
+      const prepared = child.prepareWorkerRequest({ role: "luna", instruction, routing, maxInputTokens });
+      if (!prepared.allowed) throw new Error(prepared.reason);
+      return { ...prepared.request, subtaskId: task.id, writeScopes: task.writeScopes, isolation: "worktree" };
+    });
+    if (new Set(requests.map((entry) => entry.requestId)).size !== requests.length) throw new Error("Parallel request IDs must be unique.");
+    state = transitionState(state, "worker_started", { role: "luna" });
+    orchestration = { ...orchestration, mode: "parallel", status: "executing", reason, requests, reports: [], subtasks: tasks };
+    memory = runtimeMemory(memory, state, "luna", "executing");
+    revision += 1;
+    return { requests: clone(requests), ...updateResult(previous) };
+  }
+
+  function recordExecutorReport({ requestId, report, executionError = null } = {}) {
+    const previous = capturePrevious();
+    const request = orchestration.requests.find((entry) => entry.requestId === requestId);
+    if (!request || !request.dispatched) throw new Error("Executor result requires its dispatched request ID.");
+    const validated = executionError ? { status: "failed", current_error: { type: "executor_failure", message: executionError, log: executionError } } : validateWorkerOutput("luna", report);
+    if (!executionError && validated.changed_files.some((file) => !withinWriteScopes(file, request.writeScopes))) {
+      throw new Error("Executor reported changes outside its declared write scopes. Record an executor failure and review its worktree.");
+    }
+    memory = updateWorkerMemory(memory, { ...validated, requestId, sourceRole: "luna", subtaskId: request.subtaskId, attempt: state.attempts.luna });
+    orchestration.reports.push({ requestId, subtaskId: request.subtaskId, report: clone(validated) });
+    orchestration.requests = orchestration.requests.filter((entry) => entry.requestId !== requestId);
+    if (!orchestration.requests.length) {
+      const failures = orchestration.reports.filter((entry) => implementationFailed(entry.report));
+      orchestration.status = failures.length ? "failed" : "integrating";
+      if (failures.length) {
+        const reason = `Parallel executor batch failed: ${failures.map((entry) => entry.subtaskId).join(", ")}. Inspect reports and isolated worktrees before retrying.`;
+        gate("luna_failed", { reason, report: { passed: false, reason, currentError: { type: "executor_batch_failure", message: reason, log: JSON.stringify(failures) } } });
+        return updateResult(previous);
+      }
+      state = { ...state, activeRole: "planner" };
+    }
+    revision += 1;
+    return updateResult(previous);
+  }
+
+  function recordExecutorFailure({ requestId, reason } = {}) {
+    if (!nonEmptyString(reason)) throw new Error("Executor failure reason is required.");
+    return recordExecutorReport({ requestId, executionError: reason });
+  }
+
+  function finishParentExecution({ report, validation } = {}) {
+    const previous = capturePrevious();
+    if (!canParentExecute() || pendingRequest || orchestration.requests.length) throw new Error("No direct execution or completed batch is ready for main-agent completion.");
+    const implementation = validateWorkerOutput("luna", report);
+    if (orchestration.mode === "parallel" && validation !== undefined) throw new Error("Parallel integration always requires an independent Validator.");
+    memory = updateWorkerMemory(memory, { ...implementation, sourceRole: "planner", implementationMode: orchestration.mode, attempt: state.attempts.luna });
+    orchestration.status = "validating";
+    if (implementationFailed(implementation)) {
+      const reason = implementation.current_error?.message || "Main-agent implementation/integration reported failure.";
+      gate("luna_failed", { reason, report: { passed: false, reason, tests: implementation.tests, currentError: implementation.current_error ?? { type: "main_agent_failure", message: reason, log: JSON.stringify(implementation.tests) } } });
+      orchestration.status = "failed";
+      return updateResult(previous);
+    }
+    state = transitionState(state, "worker_completed", { role: "luna" });
+    memory = runtimeMemory(memory, state, "validator", "validating");
+    if (validation !== undefined) {
+      const evidence = validateWorkerOutput("validator", validation);
+      const validationPolicy = safeEvaluatePolicy({ state, memory });
+      if (validationPolicy.validatorMode === "deep") throw new Error("High-risk tasks require independent deep validation. Submit the implementation without self-validation.");
+      if (!validationPolicy.allowed || getReasoningProfile()?.complexity !== "low") throw new Error("Only low-complexity tasks may use main-agent self-verification. Submit the implementation without self-validation and run the independent Validator.");
+      if (evidence.passed && (evidence.current_error || evidence.issues.length || !evidence.tests.length
+        || evidence.tests.some((test) => !test.passed || !test.command.trim() || !test.evidence.trim()))) throw new Error("Direct completion requires non-empty passing checks and evidence, without outstanding issues.");
+      recordValidation({ role: "luna", report: { ...evidence, validationSource: "main_agent" }, trustedHost: true });
+    }
     revision += 1;
     return updateResult(previous);
   }
@@ -804,6 +1012,7 @@ export function createRouterService({
     state = initialState();
     memory = initialTaskMemory();
     pendingRequest = null;
+    orchestration = initialOrchestration();
     revision += 1;
     return updateResult(previous);
   }
@@ -812,6 +1021,14 @@ export function createRouterService({
     getState,
     getMemory,
     getPendingRequest,
+    getOrchestration,
+    canParentExecute,
+    prepareJevAssessment: (...args) => atomically(() => prepareJevAssessment(...args)),
+    recordJevAssessment: (...args) => atomically(() => recordJevAssessment(...args)),
+    startDirectExecution: (...args) => atomically(() => startDirectExecution(...args)),
+    finishParentExecution: (...args) => atomically(() => finishParentExecution(...args)),
+    prepareParallelExecution: (...args) => atomically(() => prepareParallelExecution(...args)),
+    recordExecutorFailure: (...args) => atomically(() => recordExecutorFailure(...args)),
     getReasoningProfile,
     getPolicyDecision,
     getModelPerformanceStore,

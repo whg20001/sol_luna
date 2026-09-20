@@ -8,7 +8,7 @@
 
 Sol / Luna Router 是一个面向 Pi、Codex、DeepSeek 及其他 Agent Harness 的多模型任务运行时。它不把多个 Agent 简单串联，而是通过统一的路由服务强制执行：
 
-- Root Planner 只负责规划、调度和最终决策。
+- Root Planner 负责规划、调度和最终决策；显式选择 direct 模式后可自行修改和测试，完整并行批次成功后可负责集成。
 - Luna 是默认实现 Worker。
 - Validator 采用 Fast / Deep 两级只读验证。
 - Sol 只在累计两次会计入 Luna 熔断的失败后执行一次恢复；计数来源可以是 Deep Validator 失败，也可以是 Luna 执行异常或非法输出。
@@ -26,6 +26,20 @@ v2.1 在 v2.0 的 Context Envelope、Task Memory、Failure Snapshot 和状态机
 - 动态 Token Budget
 - Model Performance Ranking
 - Runtime Lifecycle Events
+
+### Jev 判断路由增量
+
+新增 `src/jev-router.js` 和 `src/adapters/pi-jev.js`，不改上下文投影或压缩。Jev 仅判断入口工作流（direct / plan_act / clarify）和候选子任务的并行适用性；低置信度或异常交回 Planner review / serial。默认同时要求 confidence ≥ 0.8、选项 probability ≥ 0.85，仅作为未校准的建议阈值，不授权工具。
+
+TypeSafe 是可选依赖：Pi 检测到 `typesafe_evaluate` 未安装/加载或不在活动工具列表时，自动回退原有串行 Planner → Luna → Validator / Sol 策略，不创建 Jev 等待请求，并在当前会话按项目和缺失条件提示一次可选安装；不会自动安装、启用或授权 direct/parallel。若工具在评估期间消失，则解除评估等待，但保留正在执行的 Worker 与报告。已注册工具内部的同意/认证状态仍由 TypeSafe 检查。
+
+工具可用时，Pi 通过 `sol_luna_route` 生成请求，主 Agent 原样调用现有 `typesafe_evaluate`，adapter 关联实际结果，继续沿用 TypeSafe 的同意、密钥、费用限制和超时。显式选择执行模式与 Jev 判断分离。完整流程见 README 的 **Jev advisory task routing**。
+
+- direct：主 Agent 修改、测试并提交实现报告；冻结为 low 复杂度且无高风险约束的任务可提交明确的主 Agent 测试证据完成，不创建执行 subagent；高风险仍需独立 Deep Validator。
+- parallel：先规划独立子任务再评估，每个子任务独立问题。代码限制数量（默认 4）、依赖、写入范围和请求身份。Pi 要求干净且已有提交的 Git 基线、独立 worktree、后台启动。全部报告到齐后主 Agent 集成，再独立验证。
+- 快照新增 `state.orchestration`，保存模式、判断请求与建议、并行请求集合及报告。未使用新 API 时维持旧串行流程。
+- direct 和整个 parallel 批次各占原实现通道的一次尝试，兼容保留 `attempts.luna` 和 `lunaValidationFailures` 名称；主 Agent 实现报告另标记 `sourceRole: planner`，不冒充 Worker。失败回到原有 Luna 重试 / Sol 恢复。
+- 并行是有界独立批次，不是任意 DAG 调度器。声明路径与报告检查不是 OS 沙箱，宿主应另外实施安全隔离。
 
 ## 2. 版本矩阵
 
@@ -56,7 +70,7 @@ User
 | - 理解目标                                                       |
 | - 定义 acceptance / constraints / complexity / taskType         |
 | - 调用 Router API                                                |
-| - 不直接执行实现修改                                             |
+| - 可显式直接执行；并行批次完成后负责集成                         |
 +------------------------------+-----------------------------------+
                                |
                                v
@@ -110,7 +124,7 @@ Root Planner 是宿主父会话，不是 Router 派发的普通 Worker。
 
 - 不把 Luna 或 Sol 的成功声明当作最终完成。
 - 不绕过 `prepare -> dispatch -> record` 生命周期。
-- 在 Pi 适配器激活后，Root 的 `edit`、`write` 和 `bash` 调用全部被阻止。
+- 在 Pi 适配器激活后，Root 的 `edit`、`write` 和 `bash` 仅在显式 direct 执行或完成并行批次后的集成阶段可用，其余阶段被阻止。
 - 在 Pi 中只能调用已准备的 `luna-worker`、`validator-worker` 或 `sol-worker`，非托管 Agent 被阻止。
 
 默认推理级别为 `high`，但 Pi 可从 Planner Model Route 冻结实际 thinking。
@@ -575,7 +589,7 @@ prepareWorkerRequest
 
 保护规则：
 
-- 同一时间只允许一个 `pendingRequest`。
+- 旧串行路径同一时间只允许一个 `pendingRequest`；并行路径使用有界 `orchestration.requests`，不得与串行或主 Agent 执行重叠。
 - 未准备的 Worker 不能派发。
 - 同一 request 不能重复派发。
 - 未标记 dispatched 的结果不能写入。
@@ -1129,7 +1143,7 @@ Fast 失败时再次准备 Deep Validator；Deep 失败后由状态机决定 Lun
 
 当项目已正确物化时：
 
-- Root `edit`、`write`、`bash` 被阻止。
+- Root `edit`、`write`、`bash` 默认被阻止；显式 direct 或 parallel 的 integrating 阶段允许，其他宿主权限仍生效。
 - 非托管 Agent 被阻止。
 - 项目 paused 时不注入 Sol-Luna system prompt；阻止 `sol_luna_*` 工具和三类托管 worker Agent，普通无关 Pi edit/write/bash/Agent 不受阻止。
 - runtime JSON invalid/unsafe 时不注入 Sol-Luna system prompt，阻止全部 `sol_luna_*` 工具和三类托管 worker Agent，但允许普通无关 Pi 工具与 Agent。
@@ -1137,7 +1151,7 @@ Fast 失败时再次准备 Deep Validator；Deep 失败后由状态机决定 Lun
 - `schedule`、`resume`、model override、thinking override 被阻止。
 - Agent prompt 被替换为 Router 生成的 `renderedPrompt`。
 - Agent model 和 thinking 使用 Router 的实际选择与冻结值。
-- `inherit_context=false`、`run_in_background=false` 被强制设置。
+- `inherit_context=false` 被强制设置；串行强制前台，并行强制后台且必须有 `isolation=worktree`。
 - Agent 启动失败通过 `tool_result` 回写失败状态。
 - Agent `tool_result` 的迟到结果必须同时匹配 request ID 和 task ID；手工调用 `sol_luna_record_result` 时仍应显式提供 request ID。
 
@@ -1269,6 +1283,8 @@ Snapshot 外层格式：
 | `src/runtime-events.js` | 14 类有界生命周期事件和非致命 sink |
 | `src/model-routing.js` | v1/v2 路由归一化、精确模型选择和模板渲染 |
 | `src/router-service.js` | 策略、Memory、预算、模型、事件和调用生命周期总编排 |
+| `src/jev-router.js` | Jev 请求、严格结果解释、独立批次的确定性检查 |
+| `src/adapters/pi-jev.js` | 关联现有 TypeSafe 工具、显式 direct / parallel 路由 |
 | `src/adapters/pi.js` | Pi 物化、工具、命令、权限门控、Session 持久化和项目 Token TUI |
 | `src/adapters/harness.js` | Generic Harness 事务、Worker 调用和持久化回滚 |
 | `src/adapters/codex.js` | Codex Harness 薄封装 |
@@ -1278,9 +1294,9 @@ Snapshot 外层格式：
 ## 22. 当前架构不变量
 
 ```text
-1. 在 Pi 或遵循协议的宿主中，Root Planner 不直接修改项目文件。
+1. Root Planner 仅在明确的 direct 执行或并行集成阶段修改项目文件；Jev 判断不直接授予权限。
 2. 一个任务只使用一个冻结的 Reasoning Profile。
-3. 同一时间最多存在一个 pending Worker request。
+3. 串行最多一个 pending Worker request；并行使用有界独立请求集合，不与主 Agent 写入重叠。
 4. Worker 必须先准备、持久化并标记 dispatched，结果才可记录。
 5. Luna/Sol 自报成功不能绕过 Validator。
 6. Fast Validator 失败只升级 Deep，不消耗 Luna 熔断次数。
