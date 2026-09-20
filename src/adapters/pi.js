@@ -46,6 +46,7 @@ import {
 import { CACHE_FRIENDLY_PROTOCOL_PREFIX, validateWorkerOutput } from "../prompt-protocol.js";
 import { createRouterService } from "../router-service.js";
 import { registerJevRouting } from "./pi-jev.js";
+import { createKirbyActivity, createKirbyWidget } from "../kirby-widget.js";
 import {
   formatProjectTokenShares,
   initialProjectTokenState,
@@ -1186,7 +1187,9 @@ export function createPiAdapter(pi, options = {}) {
   });
   let activeSession = null;
   let tokenUiState = initialProjectTokenState();
-  let tokenWidgetTui = null;
+  const kirbyActivity = createKirbyActivity();
+  let kirbyWidget = null;
+  let tokenWidgetGeneration = 0;
   let tokenWidgetInstalled = false;
   let tokenUiWatcher = null;
   let watcherGeneration = 0;
@@ -1246,7 +1249,12 @@ export function createPiAdapter(pi, options = {}) {
     },
   });
 
-  const requestTokenWidgetRender = () => tokenWidgetTui?.requestRender?.();
+  const requestTokenWidgetRender = () => kirbyWidget?.update();
+  const disposeTokenWidget = () => {
+    tokenWidgetGeneration++;
+    kirbyWidget?.dispose();
+    kirbyWidget = null;
+  };
 
   const resetReadRetry = (kind) => {
     const retry = readRetries[kind];
@@ -1281,8 +1289,8 @@ export function createPiAdapter(pi, options = {}) {
     const eligible = ctx.mode === "tui" && tokenUiState.visible === true
       && activeSession?.paused !== true && activeSession?.runtimeInvalid !== true;
     if (!eligible) {
+      disposeTokenWidget();
       if (tokenWidgetInstalled) ctx.ui.setWidget(TOKEN_UI_WIDGET, undefined);
-      tokenWidgetTui = null;
       tokenWidgetInstalled = false;
       return;
     }
@@ -1290,17 +1298,19 @@ export function createPiAdapter(pi, options = {}) {
       requestTokenWidgetRender();
       return;
     }
+    disposeTokenWidget();
+    const generation = tokenWidgetGeneration;
     ctx.ui.setWidget(TOKEN_UI_WIDGET, (tui) => {
-      tokenWidgetTui = tui;
-      return {
-        render(width) {
-          if (!Number.isInteger(width) || width <= 0) return [];
-          const text = formatProjectTokenShares(tokenUiState);
-          const fitted = text.length > width ? text.slice(text.length - width) : text.padStart(width, " ");
-          return [fitted];
-        },
-        invalidate() {},
-      };
+      if (generation !== tokenWidgetGeneration) return { render: () => [], invalidate() {} };
+      kirbyWidget?.dispose();
+      kirbyWidget = createKirbyWidget({
+        activity: kirbyActivity,
+        getText: () => formatProjectTokenShares(tokenUiState),
+        requestRender: () => tui.requestRender?.(),
+        setTimer, clearTimer,
+      });
+      kirbyWidget.update();
+      return kirbyWidget;
     }, { placement: "belowEditor" });
     tokenWidgetInstalled = true;
   };
@@ -1527,6 +1537,26 @@ export function createPiAdapter(pi, options = {}) {
     }
   };
 
+  // The bus reports top-level runs in this session; nested workers are owned by
+  // their parent. Do not conflate these visual counts with managed token usage.
+  const updateKirbyActivity = (event, started) => {
+    const ctx = activeSession?.ctx;
+    if (!ctx?.isProjectTrusted?.() || event?.parentAgentId) return;
+    if (event?.cwd !== undefined && (typeof event.cwd !== "string" || projectIdentity(event.cwd) !== activeSession.projectId)) return;
+    if (event?.sessionId !== undefined && event.sessionId !== ctx.sessionManager?.getSessionId?.()) return;
+    if (started ? kirbyActivity.start(event) : kirbyActivity.finish(event)) requestTokenWidgetRender();
+  };
+  let kirbySubscriptions = [];
+  const subscribeKirbyActivity = () => {
+    if (kirbySubscriptions.length || !pi.events?.on) return;
+    kirbySubscriptions = [
+      pi.events.on("subagents:started", (event) => updateKirbyActivity(event, true)),
+      pi.events.on("subagents:completed", (event) => updateKirbyActivity(event, false)),
+      pi.events.on("subagents:failed", (event) => updateKirbyActivity(event, false)),
+    ];
+  };
+  subscribeKirbyActivity();
+
   if (pi.events?.on) {
     pi.events.on("subagents:started", correlateWorkerStart);
     pi.events.on("subagents:completed", recordWorkerCompletion);
@@ -1548,12 +1578,14 @@ export function createPiAdapter(pi, options = {}) {
 
   pi.on("session_start", (_event, ctx) => {
     jevBridge.resetSession();
+    disposeTokenWidget();
+    kirbyActivity.clear();
+    subscribeKirbyActivity();
     if (activeSession?.ctx?.ui?.setWidget && tokenWidgetInstalled) {
       activeSession.ctx.ui.setWidget(TOKEN_UI_WIDGET, undefined);
     }
     closeTokenUiWatcher();
     tokenUiState = initialProjectTokenState();
-    tokenWidgetTui = null;
     tokenWidgetInstalled = false;
     clearTransientCorrelations();
     router.restore(stateFromBranch(ctx));
@@ -1589,8 +1621,11 @@ export function createPiAdapter(pi, options = {}) {
   });
 
   pi.on("session_shutdown", (_event, ctx) => {
+    disposeTokenWidget();
+    kirbyActivity.clear();
+    for (const unsubscribe of kirbySubscriptions) unsubscribe?.();
+    kirbySubscriptions = [];
     if (ctx?.ui?.setWidget) ctx.ui.setWidget(TOKEN_UI_WIDGET, undefined);
-    tokenWidgetTui = null;
     tokenWidgetInstalled = false;
     closeTokenUiWatcher();
     activeSession = null;
@@ -2294,6 +2329,7 @@ export function createPiAdapter(pi, options = {}) {
           notify(ctx, [
             `Sol-Luna token UI: ${state.visible ? "on" : "off"}`,
             `Scope: current project only (${projectId})`,
+            `Active subagents in this session: ${activeSession?.projectId === projectId ? kirbyActivity.size : 0} (18 Kirby forms; nested workers excluded)`,
             `Tokens: P=${state.tokens.planner}, L=${state.tokens.luna}, V=${state.tokens.validator}, S=${state.tokens.sol}`,
             `Shares: P(${percentages.planner}%),L(${percentages.luna}%),V(${percentages.validator}%),S(${percentages.sol}%)`,
             `State file: ${paths.tokenUi}`,

@@ -1487,6 +1487,153 @@ test("managed worker lifecycle events add project-local token totals exactly onc
   }
 });
 
+test("Kirby activity shows four live runs without charging tokens or persisting animation frames", { skip: skipWithoutPiPeers }, async () => {
+  const fake = createFakePi();
+  const scheduler = createFakeScheduler();
+  const watcher = createFakeWatch();
+  const registry = createWidgetRegistry();
+  piModule.createPiAdapter(fake.pi, { watch: watcher.watch, setTimeout: scheduler.setTimeout, clearTimeout: scheduler.clearTimeout });
+  const root = mkdtempSync(join(tmpdir(), "sol-luna-kirby-count-"));
+  const notifications = [];
+  const ctx = commandContext(root, notifications, { mode: "tui", hasUI: true, setWidget: registry.setWidget.bind(registry) });
+  const ui = fake.commands.get("sol-luna-token-ui");
+  const status = async (count) => {
+    await ui.handler("status", ctx);
+    assert.match(notifications.at(-1).message, new RegExp(`Active subagents in this session: ${count} `));
+  };
+  try {
+    fake.events.get("session_start")({}, ctx);
+    await ui.handler("on", ctx);
+    const persisted = readFileSync(tokenUiFile(root), "utf8");
+    const snapshots = fake.entries.length;
+    const jobs = ["luna-worker", "validator-worker", "sol-worker", "other-agent"].map((type, id) => ({ id: `kirby-${id}`, type }));
+    fake.emitShared("subagents:created", { id: "queued", type: "luna-worker" });
+    await status(0);
+    for (const job of jobs) fake.emitShared("subagents:started", job);
+    fake.emitShared("subagents:started", jobs[0]);
+    fake.emitShared("subagents:started", { id: "foreign", type: "luna-worker", cwd: `${root}-other` });
+    fake.emitShared("subagents:started", { id: "foreign-session", type: "luna-worker", sessionId: "other-session" });
+    fake.emitShared("subagents:started", { id: "nested", type: "luna-worker", parentAgentId: jobs[0].id });
+    await status(4);
+    assert.deepEqual(scheduler.pendingDelays(), [200]);
+    const widget = () => registry.widgets.get("sol-luna-token-ui").component;
+    const initial = widget().render(100);
+    assert.equal(initial.length, 1);
+    assert.ok(initial.at(-1).endsWith("P(0%),L(0%),V(0%),S(0%)"));
+    const frames = new Set([initial.join("\n")]);
+    for (let frame = 0; frame < 4; frame++) {
+      scheduler.runNext();
+      const lines = widget().render(100);
+      assert.equal(lines.length, 1);
+      frames.add(lines[0]);
+    }
+    assert.ok(frames.size > 1);
+    assert.equal(readFileSync(tokenUiFile(root), "utf8"), persisted);
+    assert.equal(fake.entries.length, snapshots);
+    const oldComponent = widget();
+    const staleTimer = scheduler.pendingCallbacks()[0];
+    fake.events.get("agent_settled")({}, ctx);
+    staleTimer();
+    assert.deepEqual(oldComponent.render(100), []);
+    assert.deepEqual(scheduler.pendingDelays(), [200]);
+    await status(4);
+    fake.emitShared("subagents:completed", jobs[0]);
+    fake.emitShared("subagents:completed", jobs[0]);
+    fake.emitShared("subagents:failed", jobs[1]); // No usage produced.
+    await status(2);
+    fake.emitShared("subagents:failed", { ...jobs[2], type: "wrong-type" });
+    await status(2);
+    fake.emitShared("subagents:failed", jobs[2]);
+    fake.emitShared("subagents:completed", jobs[3]);
+    await status(0);
+    assert.equal(scheduler.pendingCount(), 0);
+    assert.equal(widget().render(100).length, 1);
+    assert.equal(readFileSync(tokenUiFile(root), "utf8"), persisted);
+  } finally {
+    fake.events.get("session_shutdown")({}, ctx);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Kirby timers stop when hidden or paused, resume surviving runs, and cannot leak across sessions", { skip: skipWithoutPiPeers }, async () => {
+  const fake = createFakePi();
+  const scheduler = createFakeScheduler();
+  const registry = createWidgetRegistry();
+  piModule.createPiAdapter(fake.pi, { watch: createFakeWatch().watch, setTimeout: scheduler.setTimeout, clearTimeout: scheduler.clearTimeout });
+  const root = mkdtempSync(join(tmpdir(), "sol-luna-kirby-lifecycle-"));
+  const other = mkdtempSync(join(tmpdir(), "sol-luna-kirby-next-"));
+  const notifications = [];
+  const ctx = commandContext(root, notifications, { mode: "tui", hasUI: true, setWidget: registry.setWidget.bind(registry) });
+  const next = commandContext(other, notifications, { mode: "tui", hasUI: true, setWidget: registry.setWidget.bind(registry) });
+  const ui = fake.commands.get("sol-luna-token-ui");
+  try {
+    fake.events.get("session_start")({}, ctx);
+    await ui.handler("on", ctx);
+    const first = { id: "first", type: "luna-worker" };
+    const second = { id: "second", type: "validator-worker" };
+    fake.emitShared("subagents:started", first);
+    const stale = scheduler.pendingCallbacks()[0];
+    const oldFactory = registry.widgets.get("sol-luna-token-ui").factory;
+    await ui.handler("off", ctx);
+    stale();
+    oldFactory({ requestRender() { throw new Error("stale factory rendered"); } });
+    assert.equal(scheduler.pendingCount(), 0);
+    assert.equal(registry.widgets.size, 0);
+    fake.emitShared("subagents:started", second);
+    fake.emitShared("subagents:completed", first);
+    await ui.handler("on", ctx);
+    assert.deepEqual(scheduler.pendingDelays(), [200]);
+    await ui.handler("status", ctx);
+    assert.match(notifications.at(-1).message, /Active subagents in this session: 1 /);
+    await fake.commands.get("sol-luna-disable").handler("", ctx);
+    assert.equal(scheduler.pendingCount(), 0);
+    assert.equal(registry.widgets.size, 0);
+    fake.emitShared("subagents:failed", second);
+    fake.emitShared("subagents:started", first);
+    await fake.commands.get("sol-luna-enable").handler("", ctx);
+    assert.deepEqual(scheduler.pendingDelays(), [200]);
+    const lateTimer = scheduler.pendingCallbacks()[0];
+    fake.events.get("session_shutdown")({}, ctx);
+    lateTimer();
+    assert.equal(scheduler.pendingCount(), 0);
+    fake.emitShared("subagents:started", { id: "after-shutdown", type: "luna-worker" });
+    fake.events.get("session_start")({}, next);
+    await ui.handler("on", next);
+    await ui.handler("status", next);
+    assert.match(notifications.at(-1).message, /Active subagents in this session: 0 /);
+    assert.equal(scheduler.pendingCount(), 0);
+    fake.emitShared("subagents:started", { id: "new", type: "luna-worker" });
+    assert.deepEqual(scheduler.pendingDelays(), [200]);
+    // Corrupt pause JSON hides the UI without turning visual state into authority.
+    writeFileSync(runtimeFile(other), "{broken");
+    fake.events.get("turn_end")({ message: { role: "assistant" } }, next);
+    assert.equal(scheduler.pendingCount(), 0);
+    assert.equal(registry.widgets.size, 0);
+  } finally {
+    fake.events.get("session_shutdown")({}, next);
+    assert.equal(scheduler.pendingCount(), 0);
+    rmSync(root, { recursive: true, force: true }); rmSync(other, { recursive: true, force: true });
+  }
+});
+
+test("Kirby animations never mount or start timers outside TUI mode", { skip: skipWithoutPiPeers }, async () => {
+  for (const mode of ["rpc", "print", "json"]) {
+    const fake = createFakePi();
+    const scheduler = createFakeScheduler();
+    const registry = createWidgetRegistry();
+    piModule.createPiAdapter(fake.pi, { watch: createFakeWatch().watch, setTimeout: scheduler.setTimeout, clearTimeout: scheduler.clearTimeout });
+    const root = mkdtempSync(join(tmpdir(), "sol-luna-kirby-headless-"));
+    const ctx = commandContext(root, [], { mode, hasUI: mode === "rpc", setWidget: registry.setWidget.bind(registry) });
+    try {
+      fake.events.get("session_start")({}, ctx);
+      await fake.commands.get("sol-luna-token-ui").handler("on", ctx);
+      fake.emitShared("subagents:started", { id: "headless", type: "luna-worker" });
+      assert.equal(registry.widgets.size, 0);
+      assert.equal(scheduler.pendingCount(), 0);
+    } finally { fake.events.get("session_shutdown")({}, ctx); rmSync(root, { recursive: true, force: true }); }
+  }
+});
+
 test("project Jev opt-out persists across reloads without changing other projects or pause state", { skip: skipWithoutPiPeers }, async () => {
   const fake = createFakePi({ typesafeAvailable: true }); piModule.createPiAdapter(fake.pi);
   const root = mkdtempSync(join(tmpdir(), "sol-luna-jev-preference-"));

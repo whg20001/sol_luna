@@ -502,6 +502,20 @@ The visualization is off by default. It renders as a right-aligned line immediat
 /sol-luna-token-ui reset
 ```
 
+### Live subagent Kirby animations
+
+When the token widget is enabled, each **currently running top-level subagent in this project/session** gets a randomly selected Kirby animation to the left of `P(),L(),V(),S()`. Four running subagents show four animated Kirbys. Assignments stay stable for a run; forms do not repeat until all 18 are in use. Completion, failure, cancellation, or stopping removes the corresponding Kirby, even when no tokens were produced. Queued/prepared agents and the parent Planner are not counted.
+
+The animations use all **18 forms × 4 frames** from the supplied `kirby-pixel-overview.svg`, at the original **200 ms/frame** (0.8-second loop). SVG/SMIL cannot play directly in a terminal, so its pixel frames are downsampled into ANSI truecolor Braille thumbnails, without a browser or terminal image protocol. Each Kirby is **three columns wide and exactly one text row high**, matching the height of `P(),L(),V(),S()`. Fine artwork details are simplified at this size. The entire widget always stays on one row: when the fleet and shares do not fit, it shows `A(n)` and as much share text as fits, rather than wrapping or displaying a misleading partial fleet. Extremely narrow terminals show the count alone (`+` if even its digits cannot fit). With no active subagents only the original token text remains.
+
+- Uses `pi-subagents` lifecycle events, not model estimates or result polling. The library does not broadcast nested child runs at the top level, so those are excluded.
+- Visual counts include non-Sol-Luna subagents on this session's bus; token accounting still accepts **only** correlated managed runs.
+- One 5 fps timer serves the entire visible widget; idle, hidden, paused, non-TUI and shutdown states run no animation timer. Hiding/pausing does not forget surviving runs; a session switch/reload clears activity rather than treating saved historical requests as live workers.
+- Animation frames/counts never enter model context, token totals, or persisted router state. `/sol-luna-token-ui status` also reports the live count.
+- Existing `/sol-luna-token-ui on|off` controls the combined display. The default remains off, and the project's pause preference is not changed automatically.
+
+The generated `src/kirby-frames.js` bundles the **72 final single-row icons** with the plugin. Pixel sampling happens once in the offline builder; runtime only selects a frame, without decompression, pixel buffers, or thumbnail caches. Developers can regenerate it from a checkout with `npm run build:kirby`; `npm run check` verifies that it matches the original SVG. Runtime rendering never executes SVG code or reads arbitrary project SVG files.
+
 Accounting remains active while the visualization is hidden. Totals persist in `.pi/sol-luna-ui.json`, are isolated by the canonical current-project path, continue across sessions and tasks in that project, and never use Pi's global token totals. Updates use an ownership-tagged project-local lock plus atomic replacement, and an active TUI watches the file so another Pi session in the same project can refresh the displayed shares. `reset` clears only the current project's P/L/V/S counters while preserving visibility and replay-deduplication history; it can also explicitly repair malformed project token JSON without following unsafe paths. It is intentionally separate from `/sol-luna-reset`, which resets only the current session's routing circuit. `/sol-luna-remove` preserves the project token file.
 
 Planner totals are staged at Pi `message_end` and committed from the final `turn_end` assistant usage. Worker dispatches receive a request-specific description and are counted only when pi-subagents lifecycle events match that description, managed role, pending request, and Agent ID. The UI therefore does not rely on the model calling `sol_luna_record_usage`, which remains dedicated to budget and performance feedback.

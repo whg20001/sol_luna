@@ -1190,6 +1190,16 @@ P(…%),L(…%),V(…%),S(…%)
 
 显示百分比使用最大余数法稳定分配整数百分点；非零总量时四项之和恒为 100。项目文件更新通过带随机 owner 标识的短期排他锁串行化 read-modify-write，写入前再次校验 lock ownership，并使用原子 rename；TUI 监听当前项目文件变化，因此同一项目的其他 Pi Session 更新也会刷新显示。可视化默认关闭，但项目计数在隐藏期间继续。实现使用 `setWidget(..., { placement: "belowEditor" })`，不替换 Footer 或 Editor，非 TUI 模式只保留配置和统计。
 
+### 18.7 活动 subagent 卡比动画
+
+Token widget 开启时，在 `P(),L(),V(),S()` 左侧按当前项目/会话的活动顶层 subagent 数量显示卡比。每个真实 `subagents:started` 分配一个随机形态，运行期间保持不变，前 18 个不重复；`completed` / `failed`（包括 stopped/aborted）移除，零 Token 失败也会移除。排队、仅准备而未启动的请求、Planner 本身不计入；pi-subagents 不向顶层广播嵌套子 Agent，因此不统计嵌套层。
+
+- `src/kirby-widget.js` 维护独立、非持久化的活动 ID/形态映射；不从 pending request 推断运行状态，不改变 Token 去重、托管事件身份校验或任何授权。
+- 动画使用用户提供的 `kirby-pixel-overview.svg` 的 18×4 像素帧。构建脚本 `scripts/build-kirby-frames.mjs` 只识别该素材的矩形像素路径与离散透明度帧，在构建时完成区域覆盖采样，生成带来源 SHA-256、图标列宽和 72 个最终 ANSI/Braille 图标的静态资源，不执行 SVG 脚本或加载外部资源。
+- 终端以 ANSI truecolor + Braille 点阵绘制单行缩略图，200ms 一帧；每只固定 3 列×1 行，与 `P(),L(),V(),S()` 行高一致，区域覆盖采样会简化细节。整个 widget 始终最多一行，宽度不足时退化为 `A(n)` 加可容纳的占比文字，极窄时显示纯计数（数字也放不下则显示 `+`），不换行或只显示部分卡比。正常四 Agent 在占比前显示四只；空闲只保留原占比文本。运行时仅按形态和帧号选择静态图标，不再维护解压像素、采样逻辑和两层缓存。
+- 整个可见 widget 只拥有一个动画定时器；隐藏、暂停、非 TUI、空闲及销毁不运行定时器，旧回调无法恢复已销毁组件。隐藏/暂停不清空仍在工作的活动记录，结束事件仍可清理；新会话、重载、关闭清空活动记录，释放专用订阅与定时器。
+- 活动计数接受同一会话总线的普通顶层 subagent，但不据此计 Token。显式不同 cwd/sessionId 或嵌套 parentAgentId 的事件被排除；状态命令同时显示实时数量。所有视觉状态均不进入 LLM 上下文或 Router snapshot。
+
 ## 19. Generic / Codex / DeepSeek Harness
 
 `createHarnessAdapter()` 是回调驱动的宿主适配器。Codex 和 DeepSeek 只是设置不同 `harnessName` 的薄封装。
@@ -1280,6 +1290,7 @@ Snapshot 外层格式：
 | `src/prompt-protocol.js` | v2.1 固定 Prefix、Runtime Suffix、严格 JSON Schema |
 | `src/token-budget.js` | Token 估算、复杂度预算、反馈调整和上下文压缩 |
 | `src/token-share.js` | 当前项目 Token 累计、事件去重、占比舍入和显示格式 |
+| `src/kirby-widget.js` / `src/kirby-frames.js` | 活动 subagent 形态映射、预生成单行图标、终端布局及动画资源生命周期 |
 | `src/semantic-memory.js` | 语义条目、确定性词法检索和 scorer 插件 |
 | `src/model-ranking.js` | 模型性能聚合、评分和稳定候选排名 |
 | `src/runtime-events.js` | 14 类有界生命周期事件和非致命 sink |
