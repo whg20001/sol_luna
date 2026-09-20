@@ -121,25 +121,27 @@ export function createHarnessAdapter({
     }
   }
 
-  async function gate(action, payload = {}) {
+  // Router updates already carry detached snapshots. Keep the queue held through
+  // persistence, and read metadata in that same transaction as its payload.
+  function commitUpdate(operation, reason, metadata = () => ({})) {
     return transact(async () => {
-      const update = router.gate(action, payload);
-      await persist(update, "gate", { action });
-      return { ...update, snapshot: router.snapshot() };
+      const update = operation();
+      await persist(update, reason, metadata());
+      return update;
     });
+  }
+
+  async function gate(action, payload = {}) {
+    return commitUpdate(() => router.gate(action, payload), "gate", () => ({ action }));
   }
 
   async function recordWorkerReport(role, report, options = {}) {
     const normalizedRole = normalizeRole(role);
-    return transact(async () => {
-      const update = router.recordWorkerReport({
-        role: normalizedRole,
-        report,
-        requestId: options.requestId,
-      });
-      await persist(update, "worker_result", { role: normalizedRole, requestId: options.requestId });
-      return { ...update, snapshot: router.snapshot() };
-    });
+    return commitUpdate(() => router.recordWorkerReport({
+      role: normalizedRole,
+      report,
+      requestId: options.requestId,
+    }), "worker_result", () => ({ role: normalizedRole, requestId: options.requestId }));
   }
 
   async function recordValidation(role, report, options = {}) {
@@ -147,16 +149,12 @@ export function createHarnessAdapter({
     if (normalizedRole === ROUTER_ROLES.VALIDATOR) {
       throw new Error("recordValidation role must be luna or sol, not validator.");
     }
-    return transact(async () => {
-      const update = router.recordValidation({
-        role: normalizedRole,
-        report,
-        requestId: options.requestId,
-        trustedHost: true,
-      });
-      await persist(update, "validation_result", { role: normalizedRole, requestId: options.requestId });
-      return { ...update, snapshot: router.snapshot() };
-    });
+    return commitUpdate(() => router.recordValidation({
+      role: normalizedRole,
+      report,
+      requestId: options.requestId,
+      trustedHost: true,
+    }), "validation_result", () => ({ role: normalizedRole, requestId: options.requestId }));
   }
 
   async function invoke(role, input, {
@@ -359,11 +357,7 @@ export function createHarnessAdapter({
 
   async function assessRoute({ kind = "entry", summary, subtasks, signal, timeoutMs } = {}) {
     if (timeoutMs !== undefined && (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 60000)) throw new Error("Invalid Jev timeout.");
-    const prepared = await transact(async () => {
-      const update = router.prepareJevAssessment({ kind, summary, subtasks });
-      await persist(update, "jev_prepared");
-      return update;
-    });
+    const prepared = await commitUpdate(() => router.prepareJevAssessment({ kind, summary, subtasks }), "jev_prepared");
     const advice = await evaluateJevRequest(prepared.request, { evaluate, policy: jevPolicy, signal, timeoutMs });
     return transact(async () => {
       const update = router.recordJevAssessment({ assessmentId: prepared.assessmentId, response: advice.answers ? { model: advice.model, answers: advice.answers } : null, failureReason: advice.reason });
@@ -373,19 +367,11 @@ export function createHarnessAdapter({
   }
 
   async function startDirectExecution(options) {
-    return transact(async () => {
-      const update = router.startDirectExecution(options);
-      await persist(update, "direct_started");
-      return update;
-    });
+    return commitUpdate(() => router.startDirectExecution(options), "direct_started");
   }
 
   async function finishParentExecution(options) {
-    return transact(async () => {
-      const update = router.finishParentExecution(options);
-      await persist(update, "parent_result");
-      return update;
-    });
+    return commitUpdate(() => router.finishParentExecution(options), "parent_result");
   }
 
   async function invokeParallel({ reason, signal, routing, maxInputTokens } = {}) {
@@ -395,11 +381,11 @@ export function createHarnessAdapter({
       const prepared = router.prepareParallelExecution({ reason, routing, maxInputTokens });
       try {
         for (const request of prepared.requests) router.markWorkerDispatched({ role: "luna", requestId: request.requestId });
-        await persist(prepared, "parallel_started");
       } catch (error) {
         router.restore(prepared.previousSnapshot);
         throw error;
       }
+      await persist(prepared, "parallel_started");
       return prepared.requests;
     });
     // The host callback MUST honor request.isolation. All starts are persisted
@@ -437,11 +423,7 @@ export function createHarnessAdapter({
   }
 
   async function reset(metadata = {}) {
-    return transact(async () => {
-      const update = router.reset();
-      await persist(update, "reset", metadata);
-      return { ...update, snapshot: router.snapshot() };
-    });
+    return commitUpdate(router.reset, "reset", () => metadata);
   }
 
   return Object.freeze({
@@ -465,16 +447,13 @@ export function createHarnessAdapter({
     invoke,
     recordWorkerReport,
     recordValidation,
-    recordUsageFeedback: async (feedback) => transact(async () => {
-      const update = router.recordUsageFeedback(feedback);
-      await persist(update, "usage_feedback", { role: feedback?.role, requestId: feedback?.requestId });
-      return { ...update, snapshot: router.snapshot() };
-    }),
-    addSemanticMemory: async (entry, options) => transact(async () => {
-      const update = router.addSemanticMemory(entry, options);
-      await persist(update, "semantic_memory", { taskType: entry?.taskType });
-      return { ...update, snapshot: router.snapshot() };
-    }),
+    recordUsageFeedback: async (feedback) => commitUpdate(
+      () => router.recordUsageFeedback(feedback), "usage_feedback",
+      () => ({ role: feedback?.role, requestId: feedback?.requestId }),
+    ),
+    addSemanticMemory: async (entry, options) => commitUpdate(
+      () => router.addSemanticMemory(entry, options), "semantic_memory", () => ({ taskType: entry?.taskType }),
+    ),
     retrieveRelevantMemory: router.retrieveRelevantMemory,
     getReasoningProfile: router.getReasoningProfile,
     getPolicyDecision: router.getPolicyDecision,
@@ -485,11 +464,10 @@ export function createHarnessAdapter({
     finishParentExecution,
     invokeParallel,
     getModelPerformanceStore: router.getModelPerformanceStore,
-    recordModelFeedback: async (feedback) => transact(async () => {
-      const update = router.recordModelFeedback(feedback);
-      await persist(update, "model_feedback", { provider: feedback?.provider, model: feedback?.model });
-      return { ...update, snapshot: router.snapshot() };
-    }),
+    recordModelFeedback: async (feedback) => commitUpdate(
+      () => router.recordModelFeedback(feedback), "model_feedback",
+      () => ({ provider: feedback?.provider, model: feedback?.model }),
+    ),
     reset,
   });
 }

@@ -33,7 +33,9 @@ v2.1 在 v2.0 的 Context Envelope、Task Memory、Failure Snapshot 和状态机
 
 TypeSafe 是可选依赖：Pi 检测到 `typesafe_evaluate` 未安装/加载或不在活动工具列表时，自动回退原有串行 Planner → Luna → Validator / Sol 策略，不创建 Jev 等待请求，并在当前会话按项目和缺失条件提示一次可选安装；不会自动安装、启用或授权 direct/parallel。若工具在评估期间消失，则解除评估等待，但保留正在执行的 Worker 与报告。已注册工具内部的同意/认证状态仍由 TypeSafe 检查。
 
-工具可用时，Pi 通过 `sol_luna_route` 生成请求，主 Agent 原样调用现有 `typesafe_evaluate`，adapter 关联实际结果，继续沿用 TypeSafe 的同意、密钥、费用限制和超时。显式选择执行模式与 Jev 判断分离。完整流程见 README 的 **Jev advisory task routing**。
+用户可通过 `/sol-luna-jev off|on|status` 单独关闭/开启本插件的 Jev 路由。偏好保存在 `.pi/sol-luna-jev.json`（`{version: 1, enabled: boolean}`，缺省开启以兼容现有安装），与运行时暂停状态、TypeSafe 自身的认证/同意及其他插件隔离。关闭后新任务回到原串行策略，取消判断等待并忽略迟到结果，但保留已准备的执行批次和主 Agent 实施/集成工作；不提示安装。路由及事件边界读取偏好，无需重载；非法配置保守降级，符号链接拒绝。init/update/remove/reset 均保留偏好。
+
+工具可用且本插件路由开启时，Pi 通过 `sol_luna_route` 生成请求，主 Agent 原样调用现有 `typesafe_evaluate`，adapter 关联实际结果，继续沿用 TypeSafe 的同意、密钥、费用限制和超时。显式选择执行模式与 Jev 判断分离。完整流程见 README 的 **Jev advisory task routing**。
 
 - direct：主 Agent 修改、测试并提交实现报告；冻结为 low 复杂度且无高风险约束的任务可提交明确的主 Agent 测试证据完成，不创建执行 subagent；高风险仍需独立 Deep Validator。
 - parallel：先规划独立子任务再评估，每个子任务独立问题。代码限制数量（默认 4）、依赖、写入范围和请求身份。Pi 要求干净且已有提交的 Git 基线、独立 worktree、后台启动。全部报告到齐后主 Agent 集成，再独立验证。

@@ -70,6 +70,28 @@ When available, reuse your existing `pi-typesafe` extension and `typesafe_evalua
 
 After updating this package, run `/reload` and `/sol-luna-update` (or `/sol-luna-init` for a new project). The updated Luna template no longer pins `run_in_background: false`; the adapter pins serial calls to foreground and parallel calls to background. Old foreground-pinned templates are rejected for parallel dispatch with an update hint. Existing pause state is preserved; use `/sol-luna-enable` yourself when ready. Nothing automatically enables TypeSafe or Sol-Luna.
 
+### Project-level Jev opt-out
+
+Even with TypeSafe installed, you can disable **this plugin's** Jev routing explicitly:
+
+```text
+/sol-luna-jev off
+/sol-luna-jev on
+/sol-luna-jev status
+```
+
+`off` returns new tasks to the original serial strategy and stops creating Jev judgments. It cancels pending assessment waits and ignores their late results, but does not interrupt already prepared executors or direct/integration work. Recent cancelled routing requests cannot be dispatched while routing remains off. Other plugins' unrelated `typesafe_evaluate` calls are unaffected; this command does **not** run `/typesafe disable` or change TypeSafe credentials, consent, or budgets. Already running HTTP calls cannot be recalled by this plugin; their routing results are ignored.
+
+The setting persists in `.pi/sol-luna-jev.json`:
+
+```json
+{ "version": 1, "enabled": false }
+```
+
+An absent file defaults to enabled for compatibility, still subject to TypeSafe availability and consent. The setting is read at routing/event boundaries; changing it does not require a reload once the updated plugin is loaded. Preferences are isolated by project and survive init/update/remove/reset. They do not alter the Sol-Luna pause setting. Explicit opt-out suppresses installation reminders. Invalid or unsafe preferences fall back to the serial strategy; explicit `on`/`off` can replace malformed regular JSON, but never follow symlinks. Only a trusted project's operator command writes the preference. `/sol-luna-status` also shows the configured routing preference.
+
+### Routing tools
+
 The new `sol_luna_route` tool supports:
 
 | Action | Purpose |
@@ -131,7 +153,7 @@ await runtime.finishParentExecution({ report: implementationReport, validation: 
 
 For parallel work, assess `kind: "parallel"` with subtasks, then call `invokeParallel({ reason })`. The harness persists every dispatch before starting any callback and waits for every executor to settle. The host must actually create isolated worktrees with a consistent baseline and enforce permissions; the callback adapter cannot do that for an unknown harness. Integrate explicitly, call `finishParentExecution({ report })`, then invoke Validator or provide equivalent trusted-host independent verification. Injected evaluation defaults to a 5-second timeout, supports cancellation and performs no retries. No evaluator means conservative fallback, not execution permission.
 
-`pi-sol-luna-router/jev-router` exports the request builder and response interpreter without loading Pi peers. Policies can also be supplied to `createRouterService({ jevPolicy })` or `createPiAdapter(pi, { jevPolicy })`. `maxExecutors` is bounded to 2–8; default 4. This feature does not read a new project policy file.
+`pi-sol-luna-router/jev-router` exports the request builder and response interpreter without loading Pi peers. Policies can also be supplied to `createRouterService({ jevPolicy })` or `createPiAdapter(pi, { jevPolicy })`. `maxExecutors` is bounded to 2–8; default 4. Jev thresholds remain programmatic options; Pi reads only the project opt-out switch from `.pi/sol-luna-jev.json`.
 
 ## Modules
 
@@ -389,6 +411,7 @@ The pause state is stored separately in `.pi/sol-luna-runtime.json`; an absent f
 
 - `/sol-luna-disable` — pause orchestration for the current project without removing files or state
 - `/sol-luna-enable` — resume orchestration (and repair malformed regular runtime JSON)
+- `/sol-luna-jev on|off|status` — enable/disable this plugin's Jev routing per project, without changing TypeSafe globally
 - `/sol-luna-init [--force]`
 - `/sol-luna-update [--force]`
 - `/sol-luna-models` — interactive model configuration wizard

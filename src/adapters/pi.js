@@ -29,7 +29,6 @@ import {
   formatState,
   hasExactAvailableModel,
   hasManagedMarker,
-  isMaterialized,
   isPlainObject,
   managedFileDecision,
   mergeSubagents,
@@ -63,6 +62,7 @@ const AGENT_INSTALL_COMMAND = "pi install -l npm:@tintinweb/pi-subagents@0.16.1"
 const MODEL_ROUTES_FILE = "sol-luna-models.json";
 const RUNTIME_FILE = "sol-luna-runtime.json";
 const RUNTIME_VERSION = 1;
+const JEV_FILE = "sol-luna-jev.json";
 const TOKEN_UI_FILE = "sol-luna-ui.json";
 const TOKEN_UI_WIDGET = "sol-luna-token-ui";
 const MANAGED_WORKER_ROLES = new Map([
@@ -84,6 +84,7 @@ function projectPaths(cwd) {
     marker: join(configDir, "sol-luna-router.json"),
     modelRoutes: join(configDir, MODEL_ROUTES_FILE),
     runtime: join(configDir, RUNTIME_FILE),
+    jev: join(configDir, JEV_FILE),
     tokenUi: join(configDir, TOKEN_UI_FILE),
     tokenUiLock: join(configDir, `.${TOKEN_UI_FILE}.lock`),
     luna: join(configDir, "agents", "luna-worker.md"),
@@ -230,9 +231,7 @@ function readProjectRuntimeState(paths, { repairInvalid = false } = {}) {
   const missing = () => ({
     state: initialProjectRuntimeState(),
     repaired: false,
-    status: "missing",
     missing: true,
-    valid: false,
   });
   const configStat = lstatOrUndefined(paths.configDir);
   if (!configStat) return missing();
@@ -245,9 +244,7 @@ function readProjectRuntimeState(paths, { repairInvalid = false } = {}) {
     return {
       state: normalizeProjectRuntimeState(JSON.parse(text)),
       repaired: false,
-      status: "valid",
       missing: false,
-      valid: true,
     };
   } catch (error) {
     if (!repairInvalid) {
@@ -257,9 +254,7 @@ function readProjectRuntimeState(paths, { repairInvalid = false } = {}) {
     return {
       state: initialProjectRuntimeState(),
       repaired: true,
-      status: "invalid",
       missing: false,
-      valid: false,
     };
   }
 }
@@ -267,6 +262,21 @@ function readProjectRuntimeState(paths, { repairInvalid = false } = {}) {
 function writeProjectRuntimeState(paths, paused) {
   assertDirectory(paths.configDir);
   writeAtomic(paths.runtime, jsonText({ version: RUNTIME_VERSION, paused: paused === true }));
+}
+
+function readProjectJevState(paths) {
+  const defaults = { version: 1, enabled: true };
+  const configStat = lstatOrUndefined(paths.configDir);
+  if (!configStat) return defaults;
+  if (configStat.isSymbolicLink() || !configStat.isDirectory()) {
+    throw new Error(`Refusing unsafe project configuration directory: ${paths.configDir}`);
+  }
+  const state = readJson(paths.jev, { defaultValue: defaults });
+  if (state.version !== 1 || typeof state.enabled !== "boolean"
+    || Object.keys(state).some((key) => !["version", "enabled"].includes(key))) {
+    throw new Error(`${JEV_FILE} must contain only { version: 1, enabled: boolean }.`);
+  }
+  return state;
 }
 
 function readProjectTokenState(paths, { repairInvalid = false } = {}) {
@@ -431,35 +441,6 @@ function validMarker(marker) {
   });
 }
 
-function materialization(cwd) {
-  try {
-    const paths = projectPaths(cwd);
-    const marker = readMarker(paths);
-    if (!validMarker(marker) || marker.managedMarker !== MANAGED_MARKER || marker.version !== PACKAGE_VERSION) return false;
-    const expectedTemplates = templateContents();
-    const managedFiles = {
-      "agents/luna-worker.md": paths.luna,
-      "agents/validator-worker.md": paths.validator,
-      "agents/sol-worker.md": paths.sol,
-    };
-    const integrity = Object.entries(managedFiles).every(([relative, path]) => {
-      const content = readText(path);
-      const expectedHash = sha256(expectedTemplates[relative]);
-      return content !== undefined
-        && sha256(content) === expectedHash
-        && marker.managedFiles[relative] === expectedHash;
-    });
-    return integrity && isMaterialized({
-      markerExists: true,
-      lunaExists: true,
-      validatorExists: true,
-      solExists: true,
-    });
-  } catch {
-    return false;
-  }
-}
-
 function managedRuntimeState(cwd) {
   try {
     const paths = projectPaths(cwd);
@@ -469,8 +450,15 @@ function managedRuntimeState(cwd) {
         .some((path) => lstatOrUndefined(path) !== undefined);
       return managedAgentPresent ? "unsafe" : "inactive";
     }
-    if (!validMarker(marker) || marker.managedMarker !== MANAGED_MARKER) return "unsafe";
-    return materialization(cwd) ? "ready" : "unsafe";
+    if (!validMarker(marker) || marker.managedMarker !== MANAGED_MARKER || marker.version !== PACKAGE_VERSION) return "unsafe";
+    const integrity = Object.entries(templateContents()).every(([relative, expected]) => {
+      const content = readText(join(paths.configDir, relative));
+      const expectedHash = sha256(expected);
+      return content !== undefined
+        && sha256(content) === expectedHash
+        && marker.managedFiles[relative] === expectedHash;
+    });
+    return integrity ? "ready" : "unsafe";
   } catch {
     return "unsafe";
   }
@@ -876,10 +864,17 @@ function statusReport(pi, ctx, state) {
   } catch (error) {
     runtimeLine = `Runtime: invalid (${error instanceof Error ? error.message : String(error)})`;
   }
+  let jevLine;
+  try {
+    jevLine = `Jev routing: ${readProjectJevState(paths).enabled ? "enabled (TypeSafe consent is separate)" : "disabled; original serial strategy"} (${CONFIG_DIR_NAME}/${JEV_FILE})`;
+  } catch {
+    jevLine = `Jev routing: invalid/unsafe preference; original serial strategy (${CONFIG_DIR_NAME}/${JEV_FILE})`;
+  }
   const report = [
     `pi-sol-luna-router ${PACKAGE_VERSION}`,
     `Project trusted: ${ctx.isProjectTrusted()}`,
     runtimeLine,
+    jevLine,
     `Agent dependency: ${hasAgentTool(pi) ? "present" : `missing — install with: ${AGENT_INSTALL_COMMAND}`}`,
     ...routeLines,
     `Marker: ${markerLine}`,
@@ -1168,7 +1163,7 @@ ${CACHE_FRIENDLY_PROTOCOL_PREFIX}
 ${useJev ? `- The parent is the Root Planner and may also execute: understand the goal, define acceptance criteria, choose direct execution or Plan-Act, and make the final decision. Parent edit/write/bash are available only after explicitly selecting direct execution, or while integrating a finished parallel batch.
 - For a new task, use sol_luna_route(action=entry, summary=...) to prepare a Jev judgment from a permitted summary only. Copy evaluation_request unchanged to typesafe_evaluate; actual results are correlated automatically. Never send secrets, files, or full conversation history. If unavailable, cancel_assessment and use Planner review. Jev is advisory only, not proof or permission.
 - Start each task with sol_luna_gate(action=start_task); pass jev_assessment_id to retain a completed entry assessment. Choose complexity before the task profile freezes. For clear bounded work, explicitly choose sol_luna_route(action=direct, reason=...), implement and test in this main session, then submit action=complete with an implementation report and verification evidence. Low confidence means Planner review, not automatic direct execution.
-- For Plan-Act, call sol_luna_prepare_worker before every serial managed Agent call. Pass rendered_prompt unchanged. For independent parallel subtasks, first prepare sol_luna_route(action=parallel) with acceptance, non-overlapping writeScopes and dependsOn: []; evaluate its Jev questions, then explicitly select dispatch_parallel. Launch all returned Luna requests in one batch, in isolated worktrees with run_in_background true. Correlate each report using its request_id; wait for notifications, do not poll. Never edit assigned work while executors are running. Integrate only after all reports arrive, submit complete, then run the independent Validator. Worktrees are not security sandboxes.` : `- TypeSafe is unavailable. Use the original serial Plan-Act strategy; do not request Jev assessments or automatically select direct/parallel execution. TypeSafe is optional and must not block the task.
+- For Plan-Act, call sol_luna_prepare_worker before every serial managed Agent call. Pass rendered_prompt unchanged. For independent parallel subtasks, first prepare sol_luna_route(action=parallel) with acceptance, non-overlapping writeScopes and dependsOn: []; evaluate its Jev questions, then explicitly select dispatch_parallel. Launch all returned Luna requests in one batch, in isolated worktrees with run_in_background true. Correlate each report using its request_id; wait for notifications, do not poll. Never edit assigned work while executors are running. Integrate only after all reports arrive, submit complete, then run the independent Validator. Worktrees are not security sandboxes.` : `- Jev routing is disabled or TypeSafe is unavailable. Use the original serial Plan-Act strategy; do not request Jev assessments or automatically select direct/parallel execution. TypeSafe is optional and must not block the task.
 - The parent is the Root Planner: plan, define acceptance criteria, and delegate implementation. Do not edit or write project files.
 - Start each task with sol_luna_gate(action=start_task), then call sol_luna_prepare_worker before each managed Agent call. Pass rendered_prompt unchanged. Parent shell execution remains blocked in this serial workflow.`}
 - Luna is the default implementation worker. Validator is a new read-only worker for diff checks, tests, lint, and static analysis. A Luna or Sol success claim is not final until Validator passes.
@@ -1236,6 +1231,7 @@ export function createPiAdapter(pi, options = {}) {
 
   const jevBridge = registerJevRouting(pi, {
     router, persist: persistState,
+    isJevEnabled: (ctx) => readProjectJevState(projectPaths(projectIdentity(ctx.cwd))).enabled,
     assertEnabled: (ctx) => {
       assertRuntimeEnabled(ctx);
       if (ctx?.cwd && managedRuntimeState(ctx.cwd) !== "ready") throw new Error("Jev routing requires an initialized, intact Sol-Luna runtime.");
@@ -1551,7 +1547,7 @@ export function createPiAdapter(pi, options = {}) {
   }
 
   pi.on("session_start", (_event, ctx) => {
-    jevBridge.resetNotices();
+    jevBridge.resetSession();
     if (activeSession?.ctx?.ui?.setWidget && tokenWidgetInstalled) {
       activeSession.ctx.ui.setWidget(TOKEN_UI_WIDGET, undefined);
     }
@@ -1649,12 +1645,12 @@ export function createPiAdapter(pi, options = {}) {
         systemPrompt: `${_event.systemPrompt}\n\n## Validator Capability Boundary\nUse sol_luna_validate only for syntax, JSON, and Git diff/status checks. Project scripts, direct shell execution, and file mutation are unavailable; report when external CI/test evidence is still required.`,
       };
     }
-    const fallback = jevBridge.fallbackToLegacy();
+    const fallback = jevBridge.fallbackToLegacy(ctx);
     const activeRoutedTask = router.getOrchestration().mode !== "legacy"
       && !["idle", "passed", "escalated"].includes(router.getState().stage);
     const message = jevBridge.noticeOnce(ctx, fallback);
     return {
-      systemPrompt: `${_event.systemPrompt}${systemProtocol(!fallback || activeRoutedTask)}${fallback && activeRoutedTask ? "\nTypeSafe is currently unavailable. Finish the active direct/parallel task using its persisted state; use the original serial strategy for new tasks." : ""}`,
+      systemPrompt: `${_event.systemPrompt}${systemProtocol(!fallback || activeRoutedTask)}${fallback && activeRoutedTask ? "\nJev routing is currently disabled or unavailable. Finish the active direct/parallel task using its persisted state; use the original serial strategy for new tasks." : ""}`,
       ...(message ? { message } : {}),
     };
   });
@@ -1699,7 +1695,7 @@ export function createPiAdapter(pi, options = {}) {
       };
     }
 
-    if (event.toolName === "typesafe_evaluate") return jevBridge.toolCall(event);
+    if (event.toolName === "typesafe_evaluate") return jevBridge.toolCall(event, ctx);
     if (event.toolName !== "Agent") return;
     const input = event.input ?? {};
     const managedRole = MANAGED_WORKER_ROLES.get(managedWorkerAgentType(event));
@@ -2163,6 +2159,36 @@ export function createPiAdapter(pi, options = {}) {
         notify(ctx, `Sol-Luna enabled for the current project${current.repaired ? " (repaired the malformed runtime state file)" : ""}. Router state, managed files, routes, token totals, and token UI preference were preserved.`, "success");
       } catch (error) {
         notify(ctx, `Sol-Luna resume failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+      }
+    },
+  });
+
+  pi.registerCommand("sol-luna-jev", {
+    description: "Enable/disable Jev routing for this project only: on | off | status",
+    getArgumentCompletions(prefix) {
+      return ["on", "off", "status"].filter((value) => value.startsWith(prefix)).map((value) => ({ value, label: value }));
+    },
+    handler: async (args, ctx) => {
+      if (!requireTrusted(ctx)) return;
+      try {
+        const action = String(args ?? "").trim() || "status";
+        if (!["on", "off", "status"].includes(action)) throw new Error("Usage: /sol-luna-jev on|off|status");
+        const paths = projectPaths(projectIdentity(ctx.cwd));
+        if (action === "status") {
+          notify(ctx, `Jev routing: ${readProjectJevState(paths).enabled ? "enabled" : "disabled; original serial strategy"}. Project setting: ${CONFIG_DIR_NAME}/${JEV_FILE}. TypeSafe authentication and consent are separate; other plugins are unaffected.`);
+          return;
+        }
+        // Explicit operator action may replace malformed regular preference JSON,
+        // but neither directory nor file symlinks are followed.
+        assertDirectory(paths.configDir);
+        writeAtomic(paths.jev, jsonText({ version: 1, enabled: action === "on" }));
+        const fallback = jevBridge.fallbackToLegacy(ctx);
+        if (action === "off") jevBridge.noticeOnce(ctx, fallback);
+        notify(ctx, action === "off"
+          ? "Jev/TypeSafe routing disabled for this project. New tasks use the original serial strategy; pending judgments are cancelled. Active executors, direct work, runtime pause state, and other plugins' TypeSafe access are preserved."
+          : "Jev routing enabled for this project when typesafe_evaluate is available. This does not enable TypeSafe consent or resume Sol-Luna; other plugins are unchanged.", "success");
+      } catch (error) {
+        notify(ctx, `Jev routing preference failed: ${error instanceof Error ? error.message : String(error)}`, "error");
       }
     },
   });

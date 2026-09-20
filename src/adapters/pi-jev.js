@@ -6,10 +6,16 @@ import { workerOutputSchemaForRole } from "../prompt-protocol.js";
 /** Tool-mediated bridge: reuse TypeSafe consent, credentials, budgets and timeout.
  * No direct HTTP calls, key access, or model-granted capabilities live here.
  */
-export function registerJevRouting(pi, { router, assertEnabled, persist, resolveLunaRouting }) {
+export function registerJevRouting(pi, { router, assertEnabled, persist, resolveLunaRouting, isJevEnabled = () => true }) {
   const evaluations = new Map();
   const notices = new Set();
-  const availability = () => {
+  const retiredQueries = new Set();
+  const availability = (ctx) => {
+    try {
+      if (!isJevEnabled(ctx)) return { available: false, reason: "jev_disabled", notice: "Jev/TypeSafe routing is disabled for this project. Using the original serial strategy. Other plugins may still use TypeSafe. Enable this plugin's routing explicitly with /sol-luna-jev on if wanted." };
+    } catch {
+      return { available: false, reason: "jev_config_invalid", notice: "Jev routing preference is invalid or unsafe. Using the original serial strategy without a Jev request. Inspect sol-luna-jev.json or explicitly repair a regular file using /sol-luna-jev on|off; symlinks are refused." };
+    }
     try {
       if (typeof pi.getAllTools !== "function") throw new Error("Tool discovery unavailable.");
       if (!pi.getAllTools().some((tool) => tool.name === "typesafe_evaluate")) {
@@ -23,8 +29,8 @@ export function registerJevRouting(pi, { router, assertEnabled, persist, resolve
       return { available: false, reason: "typesafe_discovery_unavailable", notice: "TypeSafe tool availability could not be checked. Using the original serial strategy without an external request; check the loaded extensions before enabling Jev routing." };
     }
   };
-  const fallbackToLegacy = () => {
-    const status = availability();
+  const fallbackToLegacy = (ctx) => {
+    const status = availability(ctx);
     if (status.available) return null;
     // A tool may disappear after reload or after an assessment was prepared.
     // Release only the judgment wait, never active executors or their reports.
@@ -32,6 +38,8 @@ export function registerJevRouting(pi, { router, assertEnabled, persist, resolve
     if (pending) {
       const update = router.recordJevAssessment({ assessmentId: pending.assessmentId, response: null, failureReason: "evaluation_unavailable" });
       persist(update.previousSnapshot);
+      retiredQueries.add(pending.key);
+      if (retiredQueries.size > 32) retiredQueries.delete(retiredQueries.values().next().value);
       evaluations.clear();
     }
     return { source: "policy", advisoryOnly: true, strategy: "legacy", recommendation: "plan_act", ...status,
@@ -67,7 +75,7 @@ export function registerJevRouting(pi, { router, assertEnabled, persist, resolve
   pi.registerTool({
     name: "sol_luna_route",
     label: "Jev Task Routing",
-    description: "Prepare Jev advisory questions, explicitly select main-agent direct execution, or prepare isolated parallel executors. Does not call external services itself. If typesafe_evaluate is missing or inactive, immediately use the original serial strategy without a pending assessment. Copy evaluation_request unchanged to typesafe_evaluate; its actual tool result is correlated automatically. Submit only a permitted task summary, never secrets. Context compression is unchanged.",
+    description: "Prepare Jev advisory questions, explicitly select main-agent direct execution, or prepare isolated parallel executors. Does not call external services itself. If Jev routing is disabled or typesafe_evaluate is missing or inactive, immediately use the original serial strategy without a pending assessment. Copy evaluation_request unchanged to typesafe_evaluate; its actual tool result is correlated automatically. Submit only a permitted task summary, never secrets. Context compression is unchanged.",
     promptSnippet: "Assess workflows with Jev and select direct or isolated parallel execution",
     parameters: Type.Object({
       action: StringEnum(["entry", "parallel", "direct", "dispatch_parallel", "complete", "executor_failed", "cancel_assessment", "status"]),
@@ -85,9 +93,9 @@ export function registerJevRouting(pi, { router, assertEnabled, persist, resolve
     }),
     async execute(_id, params, signal, _onUpdate, ctx) {
       assertEnabled(ctx);
-      if (params.action === "status") return result({ ...summary(), typesafe: availability() });
+      if (params.action === "status") return result({ ...summary(), typesafe: availability(ctx) });
       if (["entry", "parallel", "dispatch_parallel"].includes(params.action)) {
-        const fallback = fallbackToLegacy();
+        const fallback = fallbackToLegacy(ctx);
         if (fallback) return result(fallback);
       }
       let update;
@@ -107,6 +115,8 @@ export function registerJevRouting(pi, { router, assertEnabled, persist, resolve
         const status = await pi.exec("git", ["status", "--porcelain", "--untracked-files=normal"], { cwd: ctx.cwd, signal });
         if (head.code !== 0 || status.code !== 0 || status.stdout?.trim()) throw new Error("Parallel worktrees require a clean, committed repository baseline. Commit or explicitly preserve current changes before dispatch; do not stash or discard user work automatically.");
         assertEnabled(ctx);
+        const fallback = fallbackToLegacy(ctx);
+        if (fallback) return result(fallback);
         signal?.throwIfAborted();
         if (router.getOrchestration().jev?.parallel?.assessmentId !== assessmentId) throw new Error("Parallel plan changed during repository checks; review the current plan first.");
         update = router.prepareParallelExecution({ reason: params.reason, routing: resolveLunaRouting(ctx) });
@@ -127,7 +137,7 @@ export function registerJevRouting(pi, { router, assertEnabled, persist, resolve
   });
   return {
     clear: () => evaluations.clear(),
-    resetNotices: () => notices.clear(),
+    resetSession: () => { notices.clear(); retiredQueries.clear(); evaluations.clear(); },
     fallbackToLegacy,
     noticeOnce(ctx, fallback) {
       if (!fallback) return undefined;
@@ -136,10 +146,18 @@ export function registerJevRouting(pi, { router, assertEnabled, persist, resolve
       notices.add(key);
       return { customType: "sol-luna-typesafe-optional", content: fallback.notice, display: true };
     },
-    toolCall(event) {
+    toolCall(event, ctx) {
       if (event.toolName !== "typesafe_evaluate") return;
       const pending = router.getOrchestration().jev?.pending;
-      if (!pending || jevRequestKey(event.input) !== pending.key) return;
+      if (!pending && !retiredQueries.size) return;
+      const key = jevRequestKey(event.input);
+      if (retiredQueries.has(key)) {
+        const status = availability(ctx);
+        if (!status.available) return { block: true, reason: status.notice };
+      }
+      if (!pending || key !== pending.key) return;
+      const fallback = fallbackToLegacy(ctx);
+      if (fallback) return { block: true, reason: fallback.notice };
       if ([...evaluations.values()].includes(pending.assessmentId)) return { block: true, reason: "This Jev assessment is already in flight." };
       if (!event.toolCallId) return { block: true, reason: "Jev routing requires a correlated tool call ID." };
       evaluations.set(event.toolCallId, pending.assessmentId);
@@ -150,6 +168,7 @@ export function registerJevRouting(pi, { router, assertEnabled, persist, resolve
       if (!assessmentId) return;
       evaluations.delete(event.toolCallId);
       try { assertEnabled(ctx); } catch { return; }
+      if (fallbackToLegacy(ctx)) return;
       if (router.getOrchestration().jev?.pending?.assessmentId !== assessmentId) return;
       let response = event.details;
       if (!response?.answers && !event.isError) {
