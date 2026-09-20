@@ -5,6 +5,7 @@ import {
   validateWorkerOutput,
 } from "../prompt-protocol.js";
 import { ROUTER_ROLES, createRouterService } from "../router-service.js";
+import { evaluateJevRequest } from "../jev-router.js";
 
 const VALID_ROLES = new Set(Object.values(ROUTER_ROLES));
 const REQUIRED_BINDING_ROLES = [ROUTER_ROLES.LUNA, ROUTER_ROLES.SOL];
@@ -42,7 +43,7 @@ function reportFromResult(result, role, requestId) {
 }
 
 export function createHarnessPromptPrefix({ harnessName = "agent harness" } = {}) {
-  return `${CACHE_FRIENDLY_PROTOCOL_PREFIX}\n\n## Host Orchestration Protocol\n- Active host: ${harnessName}.\n- The parent plans, schedules, and makes the final decision; implementation is delegated.\n- Luna implements, Validator performs read-only checks, and Sol repairs only from the latest Failure Snapshot.\n- A worker success claim never bypasses Validator or explicit host validation.\n- The parent must enforce write restrictions using host permissions or a sandbox.`;
+  return `${CACHE_FRIENDLY_PROTOCOL_PREFIX}\n\n## Host Orchestration Protocol\n- Active host: ${harnessName}.\n- The parent plans, schedules, and makes the final decision. It may implement in explicitly selected direct mode or integrate a completed parallel batch. Otherwise implementation is delegated.\n- Jev provides advisory workflow judgments only, never permissions.\n- Luna implements, Validator performs read-only checks, and Sol repairs only from the latest Failure Snapshot.\n- A worker success claim never bypasses Validator or explicit host validation.\n- The host must enforce write restrictions and isolated parallel worktrees using host permissions or a sandbox.`;
 }
 
 export function createHarnessRuntimeContext({ harnessName = "agent harness", state, memory } = {}) {
@@ -76,6 +77,9 @@ export function createHarnessAdapter({
   saveSnapshot = async () => {},
   autoRecordValidator = true,
   strictWorkerOutput = true,
+  evaluate,
+  jevPolicy,
+  parallelIsolation,
 } = {}) {
   requireFunction(invokeWorker, "invokeWorker");
   requireFunction(saveSnapshot, "saveSnapshot");
@@ -97,6 +101,7 @@ export function createHarnessAdapter({
     budgetPolicy,
     modelRoutes,
     isModelAvailable,
+    jevPolicy,
   });
   let transactionTail = Promise.resolve();
 
@@ -116,25 +121,27 @@ export function createHarnessAdapter({
     }
   }
 
-  async function gate(action, payload = {}) {
+  // Router updates already carry detached snapshots. Keep the queue held through
+  // persistence, and read metadata in that same transaction as its payload.
+  function commitUpdate(operation, reason, metadata = () => ({})) {
     return transact(async () => {
-      const update = router.gate(action, payload);
-      await persist(update, "gate", { action });
-      return { ...update, snapshot: router.snapshot() };
+      const update = operation();
+      await persist(update, reason, metadata());
+      return update;
     });
+  }
+
+  async function gate(action, payload = {}) {
+    return commitUpdate(() => router.gate(action, payload), "gate", () => ({ action }));
   }
 
   async function recordWorkerReport(role, report, options = {}) {
     const normalizedRole = normalizeRole(role);
-    return transact(async () => {
-      const update = router.recordWorkerReport({
-        role: normalizedRole,
-        report,
-        requestId: options.requestId,
-      });
-      await persist(update, "worker_result", { role: normalizedRole, requestId: options.requestId });
-      return { ...update, snapshot: router.snapshot() };
-    });
+    return commitUpdate(() => router.recordWorkerReport({
+      role: normalizedRole,
+      report,
+      requestId: options.requestId,
+    }), "worker_result", () => ({ role: normalizedRole, requestId: options.requestId }));
   }
 
   async function recordValidation(role, report, options = {}) {
@@ -142,16 +149,12 @@ export function createHarnessAdapter({
     if (normalizedRole === ROUTER_ROLES.VALIDATOR) {
       throw new Error("recordValidation role must be luna or sol, not validator.");
     }
-    return transact(async () => {
-      const update = router.recordValidation({
-        role: normalizedRole,
-        report,
-        requestId: options.requestId,
-        trustedHost: true,
-      });
-      await persist(update, "validation_result", { role: normalizedRole, requestId: options.requestId });
-      return { ...update, snapshot: router.snapshot() };
-    });
+    return commitUpdate(() => router.recordValidation({
+      role: normalizedRole,
+      report,
+      requestId: options.requestId,
+      trustedHost: true,
+    }), "validation_result", () => ({ role: normalizedRole, requestId: options.requestId }));
   }
 
   async function invoke(role, input, {
@@ -352,12 +355,75 @@ export function createHarnessAdapter({
     };
   }
 
-  async function reset(metadata = {}) {
+  async function assessRoute({ kind = "entry", summary, subtasks, signal, timeoutMs } = {}) {
+    if (timeoutMs !== undefined && (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 60000)) throw new Error("Invalid Jev timeout.");
+    const prepared = await commitUpdate(() => router.prepareJevAssessment({ kind, summary, subtasks }), "jev_prepared");
+    const advice = await evaluateJevRequest(prepared.request, { evaluate, policy: jevPolicy, signal, timeoutMs });
     return transact(async () => {
-      const update = router.reset();
-      await persist(update, "reset", metadata);
-      return { ...update, snapshot: router.snapshot() };
+      const update = router.recordJevAssessment({ assessmentId: prepared.assessmentId, response: advice.answers ? { model: advice.model, answers: advice.answers } : null, failureReason: advice.reason });
+      await persist(update, "jev_result");
+      return { ...update, advice, assessmentId: prepared.assessmentId };
     });
+  }
+
+  async function startDirectExecution(options) {
+    return commitUpdate(() => router.startDirectExecution(options), "direct_started");
+  }
+
+  async function finishParentExecution(options) {
+    return commitUpdate(() => router.finishParentExecution(options), "parent_result");
+  }
+
+  async function invokeParallel({ reason, signal, routing, maxInputTokens } = {}) {
+    if (parallelIsolation !== "worktree") throw new Error("The host must explicitly support worktree isolation before parallel invocation.");
+    signal?.throwIfAborted();
+    const requests = await transact(async () => {
+      const prepared = router.prepareParallelExecution({ reason, routing, maxInputTokens });
+      try {
+        for (const request of prepared.requests) router.markWorkerDispatched({ role: "luna", requestId: request.requestId });
+      } catch (error) {
+        router.restore(prepared.previousSnapshot);
+        throw error;
+      }
+      await persist(prepared, "parallel_started");
+      return prepared.requests;
+    });
+    // The host callback MUST honor request.isolation. All starts are persisted
+    // before any launch; every executor settles before this method returns.
+    const results = await Promise.allSettled(requests.map(async (request) => {
+      let report;
+      let failure;
+      try {
+        signal?.throwIfAborted();
+        report = validateWorkerOutput("luna", await invokeWorker({
+          ...request, harnessName, role: "luna", binding: workerBindings.luna,
+          input: request.instruction, signal, request, isolation: "worktree",
+          routerState: router.getState(), snapshot: router.snapshot(),
+        }));
+      } catch (error) {
+        failure = error instanceof Error ? error.message : String(error);
+      }
+      await transact(async () => {
+        let update;
+        try {
+          update = failure
+            ? router.recordExecutorFailure({ requestId: request.requestId, reason: failure })
+            : router.recordWorkerReport({ role: "luna", requestId: request.requestId, report });
+        } catch (error) {
+          failure = error instanceof Error ? error.message : String(error);
+          update = router.recordExecutorFailure({ requestId: request.requestId, reason: failure });
+        }
+        await persist(update, "executor_result", { requestId: request.requestId });
+      });
+      return { requestId: request.requestId, subtaskId: request.subtaskId, report, failure };
+    }));
+    const persistenceFailure = results.find((entry) => entry.status === "rejected");
+    if (persistenceFailure) throw persistenceFailure.reason;
+    return { results: results.map((entry) => entry.value), orchestration: router.getOrchestration(), state: router.getState(), snapshot: router.snapshot() };
+  }
+
+  async function reset(metadata = {}) {
+    return commitUpdate(router.reset, "reset", () => metadata);
   }
 
   return Object.freeze({
@@ -381,25 +447,27 @@ export function createHarnessAdapter({
     invoke,
     recordWorkerReport,
     recordValidation,
-    recordUsageFeedback: async (feedback) => transact(async () => {
-      const update = router.recordUsageFeedback(feedback);
-      await persist(update, "usage_feedback", { role: feedback?.role, requestId: feedback?.requestId });
-      return { ...update, snapshot: router.snapshot() };
-    }),
-    addSemanticMemory: async (entry, options) => transact(async () => {
-      const update = router.addSemanticMemory(entry, options);
-      await persist(update, "semantic_memory", { taskType: entry?.taskType });
-      return { ...update, snapshot: router.snapshot() };
-    }),
+    recordUsageFeedback: async (feedback) => commitUpdate(
+      () => router.recordUsageFeedback(feedback), "usage_feedback",
+      () => ({ role: feedback?.role, requestId: feedback?.requestId }),
+    ),
+    addSemanticMemory: async (entry, options) => commitUpdate(
+      () => router.addSemanticMemory(entry, options), "semantic_memory", () => ({ taskType: entry?.taskType }),
+    ),
     retrieveRelevantMemory: router.retrieveRelevantMemory,
     getReasoningProfile: router.getReasoningProfile,
     getPolicyDecision: router.getPolicyDecision,
+    getOrchestration: router.getOrchestration,
+    canParentExecute: router.canParentExecute,
+    assessRoute,
+    startDirectExecution,
+    finishParentExecution,
+    invokeParallel,
     getModelPerformanceStore: router.getModelPerformanceStore,
-    recordModelFeedback: async (feedback) => transact(async () => {
-      const update = router.recordModelFeedback(feedback);
-      await persist(update, "model_feedback", { provider: feedback?.provider, model: feedback?.model });
-      return { ...update, snapshot: router.snapshot() };
-    }),
+    recordModelFeedback: async (feedback) => commitUpdate(
+      () => router.recordModelFeedback(feedback), "model_feedback",
+      () => ({ provider: feedback?.provider, model: feedback?.model }),
+    ),
     reset,
   });
 }

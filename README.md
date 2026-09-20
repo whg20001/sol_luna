@@ -51,7 +51,109 @@ Task State + Memory + Feedback Manager
                Validator -> passed / escalated
 ```
 
-The compatible circuit rule remains: one initial Luna attempt, one Luna retry after the first failed validation, and exactly one new Sol recovery after the second failed validation.
+The compatible circuit rule remains: one initial Luna attempt, one Luna retry after the first failed validation, and exactly one new Sol recovery after the second failed validation. The diagram above is the legacy serial path; the optional Jev entry and parallel paths below reuse its recovery circuit.
+
+## Jev advisory task routing
+
+Jev (TypeSafe) is a **judge, not an executor or permission authority**. This feature adds two semantic assessments; it makes **no changes to context projection or compression**:
+
+1. **Entry:** recommend `direct`, `plan_act`, or `clarify`, with a complexity estimate. Uncertain or invalid results fall back to `planner_review`, never automatically to direct execution.
+2. **Parallel suitability:** after the main agent defines subtasks, judge each named subtask separately against the complete proposed batch. Only a confidently suitable batch is recommended for parallel execution. Otherwise keep the existing serial path.
+
+The main agent explicitly selects a mode; recording a Jev response alone never grants writes or launches an executor. Default advisory thresholds require both confidence >= 0.8 and the selected option's probability >= 0.85. These are conservative **uncalibrated starting values**, not correctness guarantees or authorization. Tune against measured end-to-end latency, first-pass validation rate and cost, not just routing accuracy.
+
+### Pi setup and flow
+
+TypeSafe is optional. If `typesafe_evaluate` is not installed/loaded or is inactive, Pi automatically uses the original serial Planner → Luna → Validator / Sol workflow: no waiting Jev request, no automatic direct execution, and no new parallel batch. It shows one visible reminder per project/availability condition in the session, with the optional installation command `pi install -l npm:pi-typesafe` when the tool is missing. It never installs or activates TypeSafe automatically. A judgment left pending before the tool disappeared is resolved to unavailable; active executors and their results are preserved. Registration/activation checks do not prove authentication or TypeSafe's internal consent state—those remain checked by TypeSafe when called.
+
+When available, reuse your existing `pi-typesafe` extension and `typesafe_evaluate`. No second API client, credential file or direct HTTP bypass is added. TypeSafe's `/typesafe enable` consent, authentication, budgets, timeouts and no-retry policy still apply. Submitted summaries and subtask descriptions leave the machine; do not include secrets, source dumps or conversation history.
+
+After updating this package, run `/reload` and `/sol-luna-update` (or `/sol-luna-init` for a new project). The updated Luna template no longer pins `run_in_background: false`; the adapter pins serial calls to foreground and parallel calls to background. Old foreground-pinned templates are rejected for parallel dispatch with an update hint. Existing pause state is preserved; use `/sol-luna-enable` yourself when ready. Nothing automatically enables TypeSafe or Sol-Luna.
+
+### Project-level Jev opt-out
+
+Even with TypeSafe installed, you can disable **this plugin's** Jev routing explicitly:
+
+```text
+/sol-luna-jev off
+/sol-luna-jev on
+/sol-luna-jev status
+```
+
+`off` returns new tasks to the original serial strategy and stops creating Jev judgments. It cancels pending assessment waits and ignores their late results, but does not interrupt already prepared executors or direct/integration work. Recent cancelled routing requests cannot be dispatched while routing remains off. Other plugins' unrelated `typesafe_evaluate` calls are unaffected; this command does **not** run `/typesafe disable` or change TypeSafe credentials, consent, or budgets. Already running HTTP calls cannot be recalled by this plugin; their routing results are ignored.
+
+The setting persists in `.pi/sol-luna-jev.json`:
+
+```json
+{ "version": 1, "enabled": false }
+```
+
+An absent file defaults to enabled for compatibility, still subject to TypeSafe availability and consent. The setting is read at routing/event boundaries; changing it does not require a reload once the updated plugin is loaded. Preferences are isolated by project and survive init/update/remove/reset. They do not alter the Sol-Luna pause setting. Explicit opt-out suppresses installation reminders. Invalid or unsafe preferences fall back to the serial strategy; explicit `on`/`off` can replace malformed regular JSON, but never follow symlinks. Only a trusted project's operator command writes the preference. `/sol-luna-status` also shows the configured routing preference.
+
+### Routing tools
+
+The new `sol_luna_route` tool supports:
+
+| Action | Purpose |
+|---|---|
+| `entry` | Supply a permitted `summary`; receive `assessment_id` and `evaluation_request`. |
+| `parallel` | Supply `summary` and 2–4 independent `subtasks`; receive a per-subtask evaluation request. |
+| `cancel_assessment` | Resolve an unavailable/interrupted assessment to conservative fallback; no API retry. |
+| `direct` | Explicitly select main-agent execution with a `reason`, after starting the task. |
+| `dispatch_parallel` | Explicitly prepare the assessed parallel batch with a `reason`. |
+| `executor_failed` | Record an observed executor error with `request_id` and `reason`. |
+| `complete` | Record main-agent implementation or integration evidence. |
+| `status` | Inspect mode, outstanding requests and Jev advice. |
+
+**Entry:** prepare `entry`, then call `typesafe_evaluate` with `evaluation_request` unchanged. The adapter correlates the actual tool call/result and records validated advice; the main agent does not copy or manufacture Jev answers. Start the task using `sol_luna_gate(action="start_task", jev_assessment_id=assessment_id, complexity=...)` to retain the assessment. Complexity remains frozen after start. If the tool is missing or inactive, `entry`/`parallel`/`dispatch_parallel` return `strategy: "legacy"` without preparing a judgment; continue the original serial workflow. If a registered active TypeSafe tool fails at runtime, the correlated error resolves the assessment conservatively. Use `cancel_assessment` only for an interrupted request that has not produced a result.
+
+**Direct:** call `sol_luna_route(action="direct", reason=...)`. The main agent can now edit, write and run shell tools itself, subject to all other user/host permission rules. No Executor subagent is created. Finish using `complete` with `report_json` in the existing Luna implementation schema. For tasks frozen at `complexity: "low"` with no high-risk policy requirement, optional `validation_json` in the Validator schema provides explicit main-agent verification; a passing report requires non-empty passing checks/evidence and no outstanding issues. Omit it to request an independent Validator. High-risk tasks retain independent deep validation. Jev cannot declare a task passed. Direct implementation failures return to the existing Luna retry/Sol circuit.
+
+**Parallel:** each subtask has this shape:
+
+```json
+{
+  "id": "parser-tests",
+  "instruction": "Add focused parser tests",
+  "acceptance": ["Parser tests pass"],
+  "writeScopes": ["tests/parser.test.js"],
+  "dependsOn": []
+}
+```
+
+Only independent batches are supported in this first version, **not an arbitrary dependency scheduler**. Code rejects missing criteria, duplicate IDs, overlapping literal paths/directories, traversal/globs, dependencies and batches above the cap. Pi also requires a clean repository with a commit, so worktrees have an explicit baseline; never stash, discard or commit user changes automatically to satisfy this check.
+
+After the parallel Jev assessment, explicitly call `dispatch_parallel`. Launch each returned request in **one message with multiple `Agent` calls**, using `luna-worker`, the exact `renderedPrompt`, `isolation: "worktree"`, and `run_in_background: true`. Requests are selected by exact prepared prompt and tracked by unique IDs. Wait for background notifications, then record each exact report via `sol_luna_record_result(role="luna", request_id=..., report_json=...)`. The main agent cannot mutate the main checkout while the batch is outstanding. All results must arrive before integration; an executor error waits for the other executors to settle and then records one batch-level failure. Failed worktrees are not automatically merged or deleted.
+
+After all executors succeed, the main agent may integrate their branches, test the merged result, and submit `complete` with an integration report. Pi then requires an independent Validator. Subtask success never counts as integration success. Worktree isolation is **not a security sandbox**; declared scopes and reported changes are checked, but a hostile shell-capable worker still needs OS-level isolation.
+
+No contexts are sent to Jev automatically. Pi uses the tool-mediated flow above rather than charging for every prompt/turn. Prepared queries, advice, mode, parallel requests and reports persist in the existing session snapshot. On reload, pending requests remain pending, not silently relaunched; inspect/reconcile them before continuing. Routing tool output is bounded and fails atomically rather than returning partial prompts. The existing serial API remains compatible when these new methods are unused.
+
+### Generic hosts
+
+`createHarnessAdapter` accepts optional `evaluate`, `jevPolicy`, and `parallelIsolation` options:
+
+```js
+const runtime = createHarnessAdapter({
+  workerBindings,
+  invokeWorker, // Must honor request.isolation for parallel calls.
+  saveSnapshot,
+  evaluate: (request, { signal }) => typeSafe.evaluate(request, { signal }),
+  parallelIsolation: "worktree", // Explicit host support, not a sandbox implementation.
+  jevPolicy: { minConfidence: 0.8, minProbability: 0.85, maxExecutors: 4 },
+});
+
+const entry = await runtime.assessRoute({ kind: "entry", summary: permittedSummary });
+// Review entry.advice; do not treat it as permission.
+await runtime.gate("start_task", { objective, acceptance, complexity: "low", jevAssessmentId: entry.assessmentId });
+await runtime.startDirectExecution({ reason: "Main agent selected bounded direct work" });
+// Main agent implements and runs checks.
+await runtime.finishParentExecution({ report: implementationReport, validation: verificationReport });
+```
+
+For parallel work, assess `kind: "parallel"` with subtasks, then call `invokeParallel({ reason })`. The harness persists every dispatch before starting any callback and waits for every executor to settle. The host must actually create isolated worktrees with a consistent baseline and enforce permissions; the callback adapter cannot do that for an unknown harness. Integrate explicitly, call `finishParentExecution({ report })`, then invoke Validator or provide equivalent trusted-host independent verification. Injected evaluation defaults to a 5-second timeout, supports cancellation and performs no retries. No evaluator means conservative fallback, not execution permission.
+
+`pi-sol-luna-router/jev-router` exports the request builder and response interpreter without loading Pi peers. Policies can also be supplied to `createRouterService({ jevPolicy })` or `createPiAdapter(pi, { jevPolicy })`. `maxExecutors` is bounded to 2–8; default 4. Jev thresholds remain programmatic options; Pi reads only the project opt-out switch from `.pi/sol-luna-jev.json`.
 
 ## Modules
 
@@ -67,6 +169,8 @@ src/model-ranking.js        Historical model performance ranking
 src/runtime-events.js       Bounded lifecycle analytics events
 src/model-routing.js        Multi-provider selection plus optional ranking
 src/router-service.js       Stateful host-independent runtime facade
+src/jev-router.js           Advisory Jev requests, strict answers, parallel admission
+src/adapters/pi-jev.js       TypeSafe tool correlation and explicit execution modes
 src/adapters/pi.js          Pi lifecycle, tools, commands, and project files
 src/adapters/harness.js     Generic callback harness integration
 src/adapters/codex.js       Codex-named adapter
@@ -307,6 +411,7 @@ The pause state is stored separately in `.pi/sol-luna-runtime.json`; an absent f
 
 - `/sol-luna-disable` — pause orchestration for the current project without removing files or state
 - `/sol-luna-enable` — resume orchestration (and repair malformed regular runtime JSON)
+- `/sol-luna-jev on|off|status` — enable/disable this plugin's Jev routing per project, without changing TypeSafe globally
 - `/sol-luna-init [--force]`
 - `/sol-luna-update [--force]`
 - `/sol-luna-models` — interactive model configuration wizard
@@ -321,12 +426,13 @@ The pause state is stored separately in `.pi/sol-luna-runtime.json`; an absent f
 
 ### Pi tools
 
+- `sol_luna_route` — prepares Jev judgments and explicitly selects direct/parallel execution (see above).
 - `sol_luna_gate` — starts a task, marks planning ready, and reports runtime status. It cannot record validation outcomes.
 - `sol_luna_prepare_worker` — creates the Context Envelope, request IDs, budget, snapshot reference, and rendered prompt.
 - `sol_luna_record_result` — records exact Luna/Sol/Validator JSON output and advances state.
 - `sol_luna_record_usage` — records observed tokens, latency, success/truncation, and optional model performance.
 
-The required Pi flow is:
+The compatible serial Pi flow is:
 
 1. `sol_luna_gate(action="start_task", ...)`
 2. `sol_luna_prepare_worker(role="luna", ...)`
@@ -337,7 +443,7 @@ The required Pi flow is:
 7. Record usage/model feedback when available
 8. Retry Luna once or prepare Sol when the circuit opens
 
-The adapter rewrites a managed Agent call to the exact prepared prompt, applies the routed model and thinking level, and blocks calls that are scheduled, resumed, model/thinking-overridden, unprepared, or dispatched twice. Managed agent templates intentionally omit fixed `model` and `thinking` frontmatter so pi-subagents uses these per-request routed values. Parent `edit`, `write`, and `bash` remain blocked.
+The adapter rewrites a managed Agent call to the exact prepared prompt, applies the routed model and thinking level, and blocks calls that are scheduled, resumed, model/thinking-overridden, unprepared, or dispatched twice. Managed agent templates intentionally omit fixed `model` and `thinking` frontmatter so pi-subagents uses these per-request routed values. Parent `edit`, `write`, and `bash` remain blocked except during explicitly selected direct execution or integration of a fully settled successful parallel batch.
 
 The extension adds only a static runtime protocol to the parent system prompt. Dynamic state is returned by tools rather than appended to the system prompt, improving cache stability.
 
@@ -395,6 +501,20 @@ The visualization is off by default. It renders as a right-aligned line immediat
 /sol-luna-token-ui status
 /sol-luna-token-ui reset
 ```
+
+### Live subagent Kirby animations
+
+When the token widget is enabled, each **currently running top-level subagent in this project/session** gets a randomly selected Kirby animation to the left of `P(),L(),V(),S()`. Four running subagents show four animated Kirbys. Assignments stay stable for a run; forms do not repeat until all 18 are in use. Completion, failure, cancellation, or stopping removes the corresponding Kirby, even when no tokens were produced. Queued/prepared agents and the parent Planner are not counted.
+
+The animations use all **18 forms × 4 frames** from the supplied `kirby-pixel-overview.svg`, at the original **200 ms/frame** (0.8-second loop). SVG/SMIL cannot play directly in a terminal, so its pixel frames are downsampled into ANSI truecolor Braille thumbnails, without a browser or terminal image protocol. Each Kirby is **three columns wide and exactly one text row high**, matching the height of `P(),L(),V(),S()`. Fine artwork details are simplified at this size. The entire widget always stays on one row: when the fleet and shares do not fit, it shows `A(n)` and as much share text as fits, rather than wrapping or displaying a misleading partial fleet. Extremely narrow terminals show the count alone (`+` if even its digits cannot fit). With no active subagents only the original token text remains.
+
+- Uses `pi-subagents` lifecycle events, not model estimates or result polling. The library does not broadcast nested child runs at the top level, so those are excluded.
+- Visual counts include non-Sol-Luna subagents on this session's bus; token accounting still accepts **only** correlated managed runs.
+- One 5 fps timer serves the entire visible widget; idle, hidden, paused, non-TUI and shutdown states run no animation timer. Hiding/pausing does not forget surviving runs; a session switch/reload clears activity rather than treating saved historical requests as live workers.
+- Animation frames/counts never enter model context, token totals, or persisted router state. `/sol-luna-token-ui status` also reports the live count.
+- Existing `/sol-luna-token-ui on|off` controls the combined display. The default remains off, and the project's pause preference is not changed automatically.
+
+The generated `src/kirby-frames.js` bundles the **72 final single-row icons** with the plugin. Pixel sampling happens once in the offline builder; runtime only selects a frame, without decompression, pixel buffers, or thumbnail caches. Developers can regenerate it from a checkout with `npm run build:kirby`; `npm run check` verifies that it matches the original SVG. Runtime rendering never executes SVG code or reads arbitrary project SVG files.
 
 Accounting remains active while the visualization is hidden. Totals persist in `.pi/sol-luna-ui.json`, are isolated by the canonical current-project path, continue across sessions and tasks in that project, and never use Pi's global token totals. Updates use an ownership-tagged project-local lock plus atomic replacement, and an active TUI watches the file so another Pi session in the same project can refresh the displayed shares. `reset` clears only the current project's P/L/V/S counters while preserving visibility and replay-deduplication history; it can also explicitly repair malformed project token JSON without following unsafe paths. It is intentionally separate from `/sol-luna-reset`, which resets only the current session's routing circuit. `/sol-luna-remove` preserves the project token file.
 
@@ -550,6 +670,7 @@ Host-independent imports do not load Pi peers:
 
 - `pi-sol-luna-router/core`
 - `pi-sol-luna-router/router-service`
+- `pi-sol-luna-router/jev-router`
 - `pi-sol-luna-router/context-envelope`
 - `pi-sol-luna-router/task-memory`
 - `pi-sol-luna-router/prompt-protocol`

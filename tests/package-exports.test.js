@@ -2,10 +2,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 test("host-independent package subpaths are importable without Pi peers", async () => {
-  const [core, modelRouting, service, contextEnvelope, taskMemory, promptProtocol, tokenBudget, executionPolicy, semanticMemory, modelRanking, runtimeEvents, harness, codex, deepseek] = await Promise.all([
+  const [core, modelRouting, service, jevRouter, contextEnvelope, taskMemory, promptProtocol, tokenBudget, executionPolicy, semanticMemory, modelRanking, runtimeEvents, harness, codex, deepseek] = await Promise.all([
     import("pi-sol-luna-router/core"),
     import("pi-sol-luna-router/model-routing"),
     import("pi-sol-luna-router/router-service"),
+    import("pi-sol-luna-router/jev-router"),
     import("pi-sol-luna-router/context-envelope"),
     import("pi-sol-luna-router/task-memory"),
     import("pi-sol-luna-router/prompt-protocol"),
@@ -22,6 +23,7 @@ test("host-independent package subpaths are importable without Pi peers", async 
   assert.equal(typeof core.transitionState, "function");
   assert.equal(typeof modelRouting.resolveModelRoutes, "function");
   assert.equal(typeof service.createRouterService, "function");
+  assert.equal(typeof jevRouter.buildJevRequest, "function");
   assert.equal(typeof contextEnvelope.buildContextEnvelope, "function");
   assert.equal(typeof taskMemory.createFailureSnapshot, "function");
   assert.equal(typeof promptProtocol.renderWorkerPrompt, "function");

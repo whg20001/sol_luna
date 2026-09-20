@@ -16,6 +16,7 @@ coverage/
 .pi/sol-luna-router.json
 .pi/sol-luna-models.json
 .pi/sol-luna-runtime.json
+.pi/sol-luna-jev.json
 .pi/sol-luna-ui.json
 .pi/.sol-luna-ui.json.lock
 .pi/npm/

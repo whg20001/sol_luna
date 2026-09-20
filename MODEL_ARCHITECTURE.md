@@ -8,7 +8,7 @@
 
 Sol / Luna Router 是一个面向 Pi、Codex、DeepSeek 及其他 Agent Harness 的多模型任务运行时。它不把多个 Agent 简单串联，而是通过统一的路由服务强制执行：
 
-- Root Planner 只负责规划、调度和最终决策。
+- Root Planner 负责规划、调度和最终决策；显式选择 direct 模式后可自行修改和测试，完整并行批次成功后可负责集成。
 - Luna 是默认实现 Worker。
 - Validator 采用 Fast / Deep 两级只读验证。
 - Sol 只在累计两次会计入 Luna 熔断的失败后执行一次恢复；计数来源可以是 Deep Validator 失败，也可以是 Luna 执行异常或非法输出。
@@ -26,6 +26,22 @@ v2.1 在 v2.0 的 Context Envelope、Task Memory、Failure Snapshot 和状态机
 - 动态 Token Budget
 - Model Performance Ranking
 - Runtime Lifecycle Events
+
+### Jev 判断路由增量
+
+新增 `src/jev-router.js` 和 `src/adapters/pi-jev.js`，不改上下文投影或压缩。Jev 仅判断入口工作流（direct / plan_act / clarify）和候选子任务的并行适用性；低置信度或异常交回 Planner review / serial。默认同时要求 confidence ≥ 0.8、选项 probability ≥ 0.85，仅作为未校准的建议阈值，不授权工具。
+
+TypeSafe 是可选依赖：Pi 检测到 `typesafe_evaluate` 未安装/加载或不在活动工具列表时，自动回退原有串行 Planner → Luna → Validator / Sol 策略，不创建 Jev 等待请求，并在当前会话按项目和缺失条件提示一次可选安装；不会自动安装、启用或授权 direct/parallel。若工具在评估期间消失，则解除评估等待，但保留正在执行的 Worker 与报告。已注册工具内部的同意/认证状态仍由 TypeSafe 检查。
+
+用户可通过 `/sol-luna-jev off|on|status` 单独关闭/开启本插件的 Jev 路由。偏好保存在 `.pi/sol-luna-jev.json`（`{version: 1, enabled: boolean}`，缺省开启以兼容现有安装），与运行时暂停状态、TypeSafe 自身的认证/同意及其他插件隔离。关闭后新任务回到原串行策略，取消判断等待并忽略迟到结果，但保留已准备的执行批次和主 Agent 实施/集成工作；不提示安装。路由及事件边界读取偏好，无需重载；非法配置保守降级，符号链接拒绝。init/update/remove/reset 均保留偏好。
+
+工具可用且本插件路由开启时，Pi 通过 `sol_luna_route` 生成请求，主 Agent 原样调用现有 `typesafe_evaluate`，adapter 关联实际结果，继续沿用 TypeSafe 的同意、密钥、费用限制和超时。显式选择执行模式与 Jev 判断分离。完整流程见 README 的 **Jev advisory task routing**。
+
+- direct：主 Agent 修改、测试并提交实现报告；冻结为 low 复杂度且无高风险约束的任务可提交明确的主 Agent 测试证据完成，不创建执行 subagent；高风险仍需独立 Deep Validator。
+- parallel：先规划独立子任务再评估，每个子任务独立问题。代码限制数量（默认 4）、依赖、写入范围和请求身份。Pi 要求干净且已有提交的 Git 基线、独立 worktree、后台启动。全部报告到齐后主 Agent 集成，再独立验证。
+- 快照新增 `state.orchestration`，保存模式、判断请求与建议、并行请求集合及报告。未使用新 API 时维持旧串行流程。
+- direct 和整个 parallel 批次各占原实现通道的一次尝试，兼容保留 `attempts.luna` 和 `lunaValidationFailures` 名称；主 Agent 实现报告另标记 `sourceRole: planner`，不冒充 Worker。失败回到原有 Luna 重试 / Sol 恢复。
+- 并行是有界独立批次，不是任意 DAG 调度器。声明路径与报告检查不是 OS 沙箱，宿主应另外实施安全隔离。
 
 ## 2. 版本矩阵
 
@@ -56,7 +72,7 @@ User
 | - 理解目标                                                       |
 | - 定义 acceptance / constraints / complexity / taskType         |
 | - 调用 Router API                                                |
-| - 不直接执行实现修改                                             |
+| - 可显式直接执行；并行批次完成后负责集成                         |
 +------------------------------+-----------------------------------+
                                |
                                v
@@ -110,7 +126,7 @@ Root Planner 是宿主父会话，不是 Router 派发的普通 Worker。
 
 - 不把 Luna 或 Sol 的成功声明当作最终完成。
 - 不绕过 `prepare -> dispatch -> record` 生命周期。
-- 在 Pi 适配器激活后，Root 的 `edit`、`write` 和 `bash` 调用全部被阻止。
+- 在 Pi 适配器激活后，Root 的 `edit`、`write` 和 `bash` 仅在显式 direct 执行或完成并行批次后的集成阶段可用，其余阶段被阻止。
 - 在 Pi 中只能调用已准备的 `luna-worker`、`validator-worker` 或 `sol-worker`，非托管 Agent 被阻止。
 
 默认推理级别为 `high`，但 Pi 可从 Planner Model Route 冻结实际 thinking。
@@ -575,7 +591,7 @@ prepareWorkerRequest
 
 保护规则：
 
-- 同一时间只允许一个 `pendingRequest`。
+- 旧串行路径同一时间只允许一个 `pendingRequest`；并行路径使用有界 `orchestration.requests`，不得与串行或主 Agent 执行重叠。
 - 未准备的 Worker 不能派发。
 - 同一 request 不能重复派发。
 - 未标记 dispatched 的结果不能写入。
@@ -1129,7 +1145,7 @@ Fast 失败时再次准备 Deep Validator；Deep 失败后由状态机决定 Lun
 
 当项目已正确物化时：
 
-- Root `edit`、`write`、`bash` 被阻止。
+- Root `edit`、`write`、`bash` 默认被阻止；显式 direct 或 parallel 的 integrating 阶段允许，其他宿主权限仍生效。
 - 非托管 Agent 被阻止。
 - 项目 paused 时不注入 Sol-Luna system prompt；阻止 `sol_luna_*` 工具和三类托管 worker Agent，普通无关 Pi edit/write/bash/Agent 不受阻止。
 - runtime JSON invalid/unsafe 时不注入 Sol-Luna system prompt，阻止全部 `sol_luna_*` 工具和三类托管 worker Agent，但允许普通无关 Pi 工具与 Agent。
@@ -1137,7 +1153,7 @@ Fast 失败时再次准备 Deep Validator；Deep 失败后由状态机决定 Lun
 - `schedule`、`resume`、model override、thinking override 被阻止。
 - Agent prompt 被替换为 Router 生成的 `renderedPrompt`。
 - Agent model 和 thinking 使用 Router 的实际选择与冻结值。
-- `inherit_context=false`、`run_in_background=false` 被强制设置。
+- `inherit_context=false` 被强制设置；串行强制前台，并行强制后台且必须有 `isolation=worktree`。
 - Agent 启动失败通过 `tool_result` 回写失败状态。
 - Agent `tool_result` 的迟到结果必须同时匹配 request ID 和 task ID；手工调用 `sol_luna_record_result` 时仍应显式提供 request ID。
 
@@ -1173,6 +1189,16 @@ P(…%),L(…%),V(…%),S(…%)
 计数公式为 `input + output + cacheWrite`，明确排除 `cacheRead`。Worker 调度时注入包含 request ID 的确定性 description，并使用 pi-subagents 的 `subagents:started` 将该 description、agent type 与当前 pending request 三者关联；后续只接受同一 Agent ID 的 `subagents:completed`/`subagents:failed`，每个 Agent ID 只记一次，不能仅凭 agent type 或 `sol_luna_record_usage` 计费。Planner 使用 Assistant message 摘要去重；包含 `start_task` 的首条 Planner 消息只在 Gate 成功并持久化后提交。
 
 显示百分比使用最大余数法稳定分配整数百分点；非零总量时四项之和恒为 100。项目文件更新通过带随机 owner 标识的短期排他锁串行化 read-modify-write，写入前再次校验 lock ownership，并使用原子 rename；TUI 监听当前项目文件变化，因此同一项目的其他 Pi Session 更新也会刷新显示。可视化默认关闭，但项目计数在隐藏期间继续。实现使用 `setWidget(..., { placement: "belowEditor" })`，不替换 Footer 或 Editor，非 TUI 模式只保留配置和统计。
+
+### 18.7 活动 subagent 卡比动画
+
+Token widget 开启时，在 `P(),L(),V(),S()` 左侧按当前项目/会话的活动顶层 subagent 数量显示卡比。每个真实 `subagents:started` 分配一个随机形态，运行期间保持不变，前 18 个不重复；`completed` / `failed`（包括 stopped/aborted）移除，零 Token 失败也会移除。排队、仅准备而未启动的请求、Planner 本身不计入；pi-subagents 不向顶层广播嵌套子 Agent，因此不统计嵌套层。
+
+- `src/kirby-widget.js` 维护独立、非持久化的活动 ID/形态映射；不从 pending request 推断运行状态，不改变 Token 去重、托管事件身份校验或任何授权。
+- 动画使用用户提供的 `kirby-pixel-overview.svg` 的 18×4 像素帧。构建脚本 `scripts/build-kirby-frames.mjs` 只识别该素材的矩形像素路径与离散透明度帧，在构建时完成区域覆盖采样，生成带来源 SHA-256、图标列宽和 72 个最终 ANSI/Braille 图标的静态资源，不执行 SVG 脚本或加载外部资源。
+- 终端以 ANSI truecolor + Braille 点阵绘制单行缩略图，200ms 一帧；每只固定 3 列×1 行，与 `P(),L(),V(),S()` 行高一致，区域覆盖采样会简化细节。整个 widget 始终最多一行，宽度不足时退化为 `A(n)` 加可容纳的占比文字，极窄时显示纯计数（数字也放不下则显示 `+`），不换行或只显示部分卡比。正常四 Agent 在占比前显示四只；空闲只保留原占比文本。运行时仅按形态和帧号选择静态图标，不再维护解压像素、采样逻辑和两层缓存。
+- 整个可见 widget 只拥有一个动画定时器；隐藏、暂停、非 TUI、空闲及销毁不运行定时器，旧回调无法恢复已销毁组件。隐藏/暂停不清空仍在工作的活动记录，结束事件仍可清理；新会话、重载、关闭清空活动记录，释放专用订阅与定时器。
+- 活动计数接受同一会话总线的普通顶层 subagent，但不据此计 Token。显式不同 cwd/sessionId 或嵌套 parentAgentId 的事件被排除；状态命令同时显示实时数量。所有视觉状态均不进入 LLM 上下文或 Router snapshot。
 
 ## 19. Generic / Codex / DeepSeek Harness
 
@@ -1264,11 +1290,14 @@ Snapshot 外层格式：
 | `src/prompt-protocol.js` | v2.1 固定 Prefix、Runtime Suffix、严格 JSON Schema |
 | `src/token-budget.js` | Token 估算、复杂度预算、反馈调整和上下文压缩 |
 | `src/token-share.js` | 当前项目 Token 累计、事件去重、占比舍入和显示格式 |
+| `src/kirby-widget.js` / `src/kirby-frames.js` | 活动 subagent 形态映射、预生成单行图标、终端布局及动画资源生命周期 |
 | `src/semantic-memory.js` | 语义条目、确定性词法检索和 scorer 插件 |
 | `src/model-ranking.js` | 模型性能聚合、评分和稳定候选排名 |
 | `src/runtime-events.js` | 14 类有界生命周期事件和非致命 sink |
 | `src/model-routing.js` | v1/v2 路由归一化、精确模型选择和模板渲染 |
 | `src/router-service.js` | 策略、Memory、预算、模型、事件和调用生命周期总编排 |
+| `src/jev-router.js` | Jev 请求、严格结果解释、独立批次的确定性检查 |
+| `src/adapters/pi-jev.js` | 关联现有 TypeSafe 工具、显式 direct / parallel 路由 |
 | `src/adapters/pi.js` | Pi 物化、工具、命令、权限门控、Session 持久化和项目 Token TUI |
 | `src/adapters/harness.js` | Generic Harness 事务、Worker 调用和持久化回滚 |
 | `src/adapters/codex.js` | Codex Harness 薄封装 |
@@ -1278,9 +1307,9 @@ Snapshot 外层格式：
 ## 22. 当前架构不变量
 
 ```text
-1. 在 Pi 或遵循协议的宿主中，Root Planner 不直接修改项目文件。
+1. Root Planner 仅在明确的 direct 执行或并行集成阶段修改项目文件；Jev 判断不直接授予权限。
 2. 一个任务只使用一个冻结的 Reasoning Profile。
-3. 同一时间最多存在一个 pending Worker request。
+3. 串行最多一个 pending Worker request；并行使用有界独立请求集合，不与主 Agent 写入重叠。
 4. Worker 必须先准备、持久化并标记 dispatched，结果才可记录。
 5. Luna/Sol 自报成功不能绕过 Validator。
 6. Fast Validator 失败只升级 Deep，不消耗 Luna 熔断次数。

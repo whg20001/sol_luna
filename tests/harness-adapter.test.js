@@ -6,6 +6,7 @@ import {
 } from "../src/adapters/harness.js";
 import { createCodexAdapter } from "../src/adapters/codex.js";
 import { createDeepSeekAdapter } from "../src/adapters/deepseek.js";
+import { createRouterService } from "../src/router-service.js";
 
 function implementationReport(role = "luna", overrides = {}) {
   return {
@@ -268,6 +269,78 @@ test("transactions serialize persistence so old rollbacks cannot erase newer sta
   await second;
   assert.deepEqual(savedTaskIds, ["first", "second"]);
   assert.equal(adapter.getState().taskId, "second");
+});
+
+test("state-update APIs preserve snapshots, metadata and rollback across persistence callbacks", async (t) => {
+  const router = createRouterService();
+  router.gate("start_task", { taskId: "commit-contract", objective: "Small local change", complexity: "low" });
+  const planning = router.snapshot();
+  const { request } = router.prepareWorkerRequest({ role: "luna", instruction: "Implement" });
+  router.markWorkerDispatched({ role: "luna", requestId: request.requestId });
+  const executing = router.snapshot();
+  router.recordWorkerReport({ role: "luna", requestId: request.requestId, report: implementationReport() });
+  const validating = router.snapshot();
+  router.restore(planning);
+  router.startDirectExecution({ reason: "Bounded local work" });
+  const direct = router.snapshot();
+  const cases = [
+    ["gate", undefined, (a) => a.gate("start_task", { taskId: "new" }), { action: "start_task" }],
+    ["worker_result", executing, (a) => a.recordWorkerReport("luna", implementationReport(), { requestId: request.requestId }), { role: "luna", requestId: request.requestId }],
+    ["validation_result", validating, (a) => a.recordValidation("luna", validatorReport()), { role: "luna", requestId: undefined }],
+    ["direct_started", planning, (a) => a.startDirectExecution({ reason: "Bounded local work" }), {}],
+    ["parent_result", direct, (a) => a.finishParentExecution({ report: implementationReport() }), {}],
+    ["usage_feedback", planning, (a) => a.recordUsageFeedback({ requestId: "usage", role: "luna", inputTokens: 10, outputTokens: 5, success: true }), { role: "luna", requestId: "usage" }],
+    ["semantic_memory", planning, (a) => a.addSemanticMemory({ summary: "Keep API contracts", taskType: "unit" }), { taskType: "unit" }],
+    ["model_feedback", planning, (a) => a.recordModelFeedback({ provider: "test", model: "local", success: true }), { provider: "test", model: "local" }],
+    ["reset", planning, (a) => a.reset({ trace: "reset" }), { trace: "reset" }],
+  ];
+  for (const [reason, snapshot, run, expectedMetadata] of cases) {
+    await t.test(reason, async () => {
+      let fail = true;
+      const saves = [];
+      const adapter = createTestAdapter({ snapshot, saveSnapshot: async (stored, metadata) => {
+        saves.push({ snapshot: structuredClone(stored), metadata: { ...metadata } });
+        stored.state.memory.task.objective = "storage callback mutation";
+        if (fail) throw new Error("storage failure");
+      } });
+      const before = adapter.getSnapshot();
+      await assert.rejects(run(adapter), /storage failure/);
+      assert.deepEqual(adapter.getSnapshot(), before);
+      fail = false;
+      const update = await run(adapter);
+      assert.deepEqual(update.previousSnapshot, before);
+      assert.deepEqual(update.snapshot, adapter.getSnapshot());
+      assert.deepEqual(update.snapshot, saves.at(-1).snapshot);
+      assert.deepEqual(saves.at(-1).metadata, { ...expectedMetadata, harnessName: "test-harness", reason });
+      update.snapshot.state.memory.task.objective = "caller mutation";
+      assert.notEqual(adapter.getMemory().task.objective, "caller mutation");
+      const count = saves.length;
+      const unchanged = await adapter.gate("status");
+      assert.equal(unchanged.changed, false);
+      assert.deepEqual(unchanged.snapshot, adapter.getSnapshot());
+      assert.equal(saves.length, count);
+    });
+  }
+});
+
+test("queued updates read payload and persistence metadata in the same transaction", async () => {
+  const started = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  const saves = [];
+  const adapter = createTestAdapter({ saveSnapshot: async (_snapshot, metadata) => {
+    saves.push(metadata);
+    if (metadata.reason === "gate") { started.resolve(); await release.promise; }
+  } });
+  const gate = adapter.gate("start_task", { taskId: "queued" });
+  await started.promise;
+  const feedback = { role: "luna", requestId: "before", success: true };
+  const recorded = adapter.recordUsageFeedback(feedback);
+  feedback.requestId = "after";
+  release.resolve();
+  await gate;
+  await recorded;
+  assert.equal(saves.at(-1).requestId, "after");
+  assert.equal(adapter.getMemory().runtime.usageFeedback.at(-1).requestId, "after");
 });
 
 test("static harness prefix does not change with runtime state", async () => {

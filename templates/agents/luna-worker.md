@@ -3,7 +3,6 @@ description: Luna implementation worker
 tools: read, grep, find, ls, bash, edit, write
 max_turns: 40
 inherit_context: false
-run_in_background: false
 exclude_extensions: pi-sol-luna-router
 ---
 <!-- pi-sol-luna-router:managed:v2 -->

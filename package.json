@@ -28,6 +28,7 @@
     "./core": "./src/core.js",
     "./model-routing": "./src/model-routing.js",
     "./router-service": "./src/router-service.js",
+    "./jev-router": "./src/jev-router.js",
     "./context-envelope": "./src/context-envelope.js",
     "./task-memory": "./src/task-memory.js",
     "./prompt-protocol": "./src/prompt-protocol.js",
@@ -49,6 +50,7 @@
     "examples/",
     "README.md",
     "MODEL_ARCHITECTURE.md",
+    "kirby-pixel-overview.svg",
     "LICENSE"
   ],
   "peerDependencies": {
@@ -70,7 +72,8 @@
   "scripts": {
     "test": "node --test",
     "test:pi": "node scripts/run-pi-tests.mjs",
-    "check": "node --check src/index.js && node --check src/core.js && node --check src/context-envelope.js && node --check src/canonical-json.js && node --check scripts/run-pi-tests.mjs && node --check src/task-memory.js && node --check src/prompt-protocol.js && node --check src/token-budget.js && node --check src/token-share.js && node --check src/execution-policy.js && node --check src/semantic-memory.js && node --check src/model-ranking.js && node --check src/runtime-events.js && node --check src/model-routing.js && node --check src/router-service.js && node --check src/adapters/pi.js && node --check src/adapters/harness.js && node --check src/adapters/codex.js && node --check src/adapters/deepseek.js && node --check examples/codex-harness.mjs && node --check examples/deepseek-harness.mjs && npm test"
+    "build:kirby": "node scripts/build-kirby-frames.mjs",
+    "check": "node scripts/build-kirby-frames.mjs --check && node --check src/kirby-widget.js && node --check src/kirby-frames.js && node --check src/index.js && node --check src/core.js && node --check src/context-envelope.js && node --check src/canonical-json.js && node --check scripts/run-pi-tests.mjs && node --check src/task-memory.js && node --check src/prompt-protocol.js && node --check src/token-budget.js && node --check src/token-share.js && node --check src/execution-policy.js && node --check src/semantic-memory.js && node --check src/model-ranking.js && node --check src/runtime-events.js && node --check src/model-routing.js && node --check src/router-service.js && node --check src/jev-router.js && node --check src/adapters/pi-jev.js && node --check src/adapters/pi.js && node --check src/adapters/harness.js && node --check src/adapters/codex.js && node --check src/adapters/deepseek.js && node --check examples/codex-harness.mjs && node --check examples/deepseek-harness.mjs && npm test"
   },
   "license": "MIT",
   "devDependencies": {
